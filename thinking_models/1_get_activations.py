@@ -14,6 +14,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
+random.seed(42)
+
 # Constants
 TRAIN_BATCH_SIZE = 32
 UPPERBOUND_MAX_NEW_TOKENS = 3000
@@ -229,13 +231,10 @@ def preprocess_instructions(instructions: list[str]) -> list[str]:
 # Save mean activations to disk for backup
 def save_tensor(
     tensor: Tensor,
-    save_dir: Path,
-    name: str,
+    file_path: Path,
 ) -> None:
-    save_dir.mkdir(exist_ok=True)
-    save_path = save_dir / f"{name}.pt"
-    torch.save(tensor, save_path)
-    print(f"Saved {name} to {save_path}")
+    torch.save(tensor, file_path)
+    print(f"Saved {file_path}")
 
 
 if __name__=="__main__":
@@ -253,10 +252,18 @@ if __name__=="__main__":
     instructions_train = preprocess_instructions(instructions_train)
     instructions_test = preprocess_instructions(instructions_test)
 
-    # Get activations
+    # Get activations and save output to disk
     sequences_activations = []
+    output_dir = Path("outputs")
+    output_dir.mkdir(exist_ok=True)
+    
     subset_instructions = instructions_train[:TRAIN_BATCH_SIZE]
     for i, instruction in enumerate(subset_instructions):
+        file_path = output_dir / f"sequences_activations_{i}.pt"
+        if file_path.exists():
+            print(f"Skipping {file_path} because it already exists")
+            continue
+
         print(f"Processing instruction {i}/{TRAIN_BATCH_SIZE}:")
         seq_activations = get_generated_tokens_activations(
             model,
@@ -267,15 +274,6 @@ if __name__=="__main__":
             module_names=["input_layernorm", "post_attention_layernorm"],
         )
         sequences_activations.append(seq_activations)
+
+        save_tensor(asdict(seq_activations), file_path)
         print("--------------------------------")
-
-    # Save the activations, each sequence is saved as a separate file
-    output_dir = Path("outputs")
-    output_dir.mkdir(exist_ok=True)
-
-    for i, seq_activations in enumerate(sequences_activations):
-        save_tensor(
-            asdict(seq_activations),
-            output_dir,
-            f"sequences_activations_{i}.pt",
-        )
