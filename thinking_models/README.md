@@ -6,7 +6,7 @@ Here is the structure of this module, please read in order:
         - [x] At `<think>` and `</think>`
         - [ ] At tokens surrounding the start and end
     - Compute candidate directions:
-        - [ ] Difference of mean
+        - [x] Difference of mean
         - [ ] SVM (TODO)
         - [ ] Sequential steering by layer: select -> steer -> select -> steer -> ...
 3. `3_select_steering_direction.ipynb`: Select the best candidate as the steering direction
