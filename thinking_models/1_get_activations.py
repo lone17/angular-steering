@@ -1,5 +1,4 @@
 import argparse
-
 import contextlib
 import functools
 import random
@@ -85,7 +84,7 @@ def get_activations_pre_hook(
     module_name: str,
     cache: dict[str, Float[Tensor, "batch token d_model"]],
     positions: list[int],
-    offload_to_cpu: bool = True,
+    offload_to_cpu: bool = False,
 ) -> Callable:
     def hook_fn(module, input):
         activation: Float[Tensor, "batch token d_model"] = input[0]
@@ -118,6 +117,7 @@ def get_generated_tokens_activations(
     max_new_tokens: int = -1,
     module_names: list[str] = ["input_layernorm", "post_attention_layernorm"],
     layers: list[int] | None = None,
+    offload_to_cpu: bool = False,
 ) -> SequenceActivations:
     if layers is None:
         # Get number of layers from model config
@@ -136,7 +136,7 @@ def get_generated_tokens_activations(
     tokens = tokenize_instructions_fn(instructions=[prompt], enable_thinking=True)
     print(f"Number of input tokens: {tokens.input_ids.shape[1]}")
 
-    generation_config = GenerationConfig(
+    generation_config = dict(
         max_new_tokens=max_new_tokens,
         do_sample=False,
         pad_token_id=tokenizer.pad_token_id,
@@ -148,7 +148,12 @@ def get_generated_tokens_activations(
     fwd_pre_hooks = [
         (
             module_dict[module_path],
-            get_activations_pre_hook(module_path, step_activations, positions=[-1]),
+            get_activations_pre_hook(
+                module_path,
+                step_activations,
+                positions=[-1],
+                offload_to_cpu=offload_to_cpu,
+            ),
         )
         for module_path in target_module_paths
     ]
@@ -163,7 +168,7 @@ def get_generated_tokens_activations(
             generated_tokens = model.generate(
                 input_ids=tokens.input_ids.to(model.device),
                 attention_mask=tokens.attention_mask.to(model.device),
-                generation_config=generation_config,
+                **generation_config,
             )
 
         generated_tokens = generated_tokens[:, start_gen_token_pos:]
@@ -183,7 +188,9 @@ def get_generated_tokens_activations(
 def load_model_and_tokenizer(
     model_id: str, device: str = DEVICE
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    model = AutoModelForCausalLM.from_pretrained(model_id, device_map=device)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, device_map=device, dtype="auto"
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     return model, tokenizer
@@ -213,12 +220,13 @@ def tokenize_instructions_qwen_chat(
 
 
 def get_dataset_instructions(random_seed=42) -> tuple[list[str], list[str]]:
-    url = "https://raw.githubusercontent.com/cvenhoff/steering-thinking-llms/refs/heads/main/messages/messages.py"
+    if not Path("messages.py").exists():
+        url = "https://raw.githubusercontent.com/cvenhoff/steering-thinking-llms/refs/heads/main/messages/messages.py"
 
-    response = requests.get(url)
-    # Save to file
-    with open("messages.py", "w") as f:
-        f.write(response.text)
+        response = requests.get(url)
+        # Save to file
+        with open("messages.py", "w") as f:
+            f.write(response.text)
 
     # Load the messages
     assert Path("messages.py").exists()
@@ -308,6 +316,11 @@ def parse_args():
         default=TRAIN_BATCH_SIZE,
         help="End index for processing instructions",
     )
+    parser.add_argument(
+        "--offload_to_cpu",
+        action="store_true",
+        help="Offload activations to CPU",
+    )
     return parser.parse_args()
 
 
@@ -352,6 +365,7 @@ if __name__ == "__main__":
             prompt=instruction,
             max_new_tokens=args.upperbound_max_new_tokens,
             module_names=args.module_names,
+            offload_to_cpu=args.offload_to_cpu,
         )
         sequences_activations.append(seq_activations)
 
