@@ -182,6 +182,11 @@ def calculate_basis(output_path: Path, extraction_point: int = EXTRACTION_POINT)
     return first_basis, second_basis
 
 
+# -----------------------------
+# Generation functions
+# -----------------------------
+
+
 def generate_completions(
     model: AutoModelForCausalLM,
     instructions: List[str],
@@ -321,6 +326,121 @@ def generate_completions_early_stop(
 
     return completions
 
+
+def generate_completions_delay(
+    model: AutoModelForCausalLM,
+    instructions: List[str],
+    tokenizer: AutoTokenizer,
+    tokenize_instructions_fn: Callable,
+    system_prompt: Optional[str] = None,
+    fwd_pre_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
+    fwd_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
+    max_new_tokens: int = 3000,
+    start_token_id: int = 151667,      # turn ON window after this appears
+    end_token_id: int = 151668,        # turn OFF after this appears
+    start_delay_n: int = 100,            # number of tokens to wait after start before enabling hooks
+):
+    """
+    Hooks are applied only in the window:
+        (start_token_id) --[wait start_delay_n tokens]-->  (hooks ON)  ... until (end_token_id) --> (hooks OFF)
+    Hooks are OFF during prefill and until the delayed window begins. Generation itself never stops due to this gating.
+    """
+
+    generation_config = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+
+
+    # ---- shared gate state (global across the batch) ----
+    gate = {
+        "enabled": False,          # whether hooks should currently run
+        "seen_start": False,       # have we seen start_token_id yet?
+        "seen_end": False,         # have we seen end_token_id yet?
+        "delay_count": 0,          # how many tokens since start we have generated
+    }
+
+    # Wrap your hooks to obey the gate
+    def gate_pre(h):
+        def wrapped(module, *args, **kwargs):
+            if not gate["enabled"]:
+                return None  # no-op for pre-hooks
+            return h(module, *args, **kwargs)
+        return wrapped
+
+    def gate_post(h):
+        def wrapped(module, *args, **kwargs):
+            if not gate["enabled"]:
+                return None  # no-op for post-hooks (keeps original output)
+            return h(module, *args, **kwargs)
+        return wrapped
+
+    gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
+    gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
+
+    # StoppingCriteria that *doesn't* stop generation; it just updates the gate each step.
+    class ToggleHooksWithDelay(StoppingCriteria):
+        def __init__(self, start_id: int, end_id: int, state: dict, delay_n: int):
+            self.start = start_id
+            self.end   = end_id
+            self.state = state
+            self.delay = max(int(delay_n), 0)
+
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+            # input_ids: [batch, cur_len]; check last generated token in this step
+            last_ids = input_ids[:, -1]
+
+            # If we see the start token for the first time, arm the delay window
+            if not self.state["seen_start"] and (last_ids == self.start).any():
+                self.state["seen_start"] = True
+                self.state["delay_count"] = 0
+                self.state["enabled"] = False  # still OFF until delay elapses
+
+            # If we already saw start and haven't seen end, step the delay counter
+            if self.state["seen_start"] and not self.state["seen_end"]:
+                # Only increment while not yet enabled
+                if not self.state["enabled"]:
+                    self.state["delay_count"] += 1
+                    if self.state["delay_count"] >= self.delay:
+                        self.state["enabled"] = True  # turn hooks ON after waiting delay_n tokens
+
+            # If we see the end token, turn hooks OFF
+            if not self.state["seen_end"] and (last_ids == self.end).any():
+                self.state["seen_end"] = True
+                self.state["enabled"] = False
+
+            return False  # never stop generation here
+
+    stopping = StoppingCriteriaList([ToggleHooksWithDelay(start_token_id, end_token_id, gate, start_delay_n)])
+
+    completions = []
+
+    tokenized = tokenize_instructions_fn(instructions=instructions)
+
+    # Register hooks for the whole generate() call; wrappers consult `gate`
+    with add_hooks(
+        module_forward_pre_hooks=gated_pre_hooks,
+        module_forward_hooks=gated_post_hooks,
+    ):
+        with torch.inference_mode():
+            generation_toks = model.generate(
+                input_ids=tokenized.input_ids.to(model.device),
+                attention_mask=tokenized.attention_mask.to(model.device),
+                stopping_criteria=stopping,  # <-- flips the gate on/off with delay
+                **generation_config,
+            )
+
+    # Keep only the generated tail
+    gen_tail = generation_toks[:, tokenized.input_ids.shape[-1]:]
+
+    for i, gen in enumerate(gen_tail):
+        completions.append({
+            "prompt": instructions[i],
+            "response": tokenizer.decode(gen, skip_special_tokens=True).strip(),
+        })
+    return completions
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -397,7 +517,7 @@ def parse_args():
         "--generation_type",
         type=str,
         default="default",
-        help="Type of generation to use (default or early_stop)",
+        help="Type of generation to use (default, early_stop or delay)",
     )
     return parser.parse_args()
 
@@ -437,7 +557,9 @@ def main() -> None:
         generate_completions_fn = generate_completions
     elif args.generation_type == "early_stop":
         generate_completions_fn = generate_completions_early_stop
-    else:
+    elif args.generation_type == "delay":
+        generate_completions_fn = generate_completions_delay
+    else:   
         raise ValueError(f"Invalid generation type: {args.generation_type}")
     
     for target_degree in args.target_angle:
