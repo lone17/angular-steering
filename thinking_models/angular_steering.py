@@ -594,8 +594,8 @@ def main() -> None:
                 max_new_tokens=args.upperbound_max_new_tokens,
             )
             print(completions[0]["response"][:500])
-            print(f"FIRST THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
-            print(f"END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
+            print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
+            print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
             print("_" * 100)
         answer_dict[target_degree][instructions_test[i]] = completions
 
