@@ -21,7 +21,7 @@ from transformers import (
     StoppingCriteriaList,
 )
 
-from i_get_activations import (
+from utility import (
     add_hooks,
     get_dataset_instructions,
     load_model_and_tokenizer,
