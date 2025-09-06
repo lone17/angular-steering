@@ -16,8 +16,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 # Constants
 TRAIN_BATCH_SIZE = 512
-UPPERBOUND_MAX_NEW_TOKENS = 4000
-DEVICE = "auto"
+UPPERBOUND_MAX_NEW_TOKENS = 32000
+DEVICE = "cuda"
 MODEL_ID = "Qwen/Qwen3-4B"
 MODEL_NAME = MODEL_ID.split("/")[-1]
 RANDOM_SEED = 42
