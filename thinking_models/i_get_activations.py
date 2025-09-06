@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Generator
+from typing import Callable, Generator, Optional
 
 import requests
 import torch
@@ -16,8 +16,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 # Constants
 TRAIN_BATCH_SIZE = 512
-UPPERBOUND_MAX_NEW_TOKENS = 32000
-DEVICE = "cuda"
+UPPERBOUND_MAX_NEW_TOKENS = 4000
+DEVICE = "auto"
 MODEL_ID = "Qwen/Qwen3-4B"
 MODEL_NAME = MODEL_ID.split("/")[-1]
 RANDOM_SEED = 42
@@ -186,11 +186,12 @@ def get_generated_tokens_activations(
 
 
 def load_model_and_tokenizer(
-    model_id: str, device: str = DEVICE
+    model_id: str, device: str = DEVICE, dtype: str = "auto"
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, device_map=device, dtype="auto"
+        model_id, device_map=device, dtype=dtype
     )
+    print(model.dtype)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     return model, tokenizer
@@ -199,22 +200,29 @@ def load_model_and_tokenizer(
 def tokenize_instructions_qwen_chat(
     tokenizer: AutoTokenizer,
     instructions: list[str],
+    system_prompt: Optional[str] = None,
     enable_thinking: bool = True,
 ) -> Int[Tensor, "batch_size seq_len"]:
     """
     Tokenize instructions for Qwen chat model.
 
     """
-    prompts = []
-    for instruction in instructions:
-        message = [{"role": "user", "content": instruction}]
-        prompt = tokenizer.apply_chat_template(
-            message,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=enable_thinking,
-        )
-        prompts.append(prompt)
+    prompts = tokenizer.apply_chat_template(
+        [
+            (
+                [{"role": "user", "content": instruction}]
+                if system_prompt is None
+                else [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": instruction},
+                ]
+            )
+            for instruction in instructions
+        ],
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=enable_thinking,
+    )
 
     return tokenizer(prompts, padding=True, truncation=False, return_tensors="pt")
 
