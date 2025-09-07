@@ -9,7 +9,7 @@ from jaxtyping import Float
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .common.utility import (
+from common.utility import (
     add_hooks,
     get_dataset_instructions,
     load_model_and_tokenizer,

@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import argparse
 import functools
 import random
+import json
 
 import numpy as np
 import torch
@@ -20,15 +21,15 @@ from transformers import (
     StoppingCriteriaList,
 )
 
-from .common.utility import (
+from common.utility import (
     add_hooks,
     get_dataset_instructions,
     load_model_and_tokenizer,
     tokenize_instructions_qwen_chat,
 )
 
-from .common.enum import GenerationType
-from .common.schema import (
+from common.enum import GenerationType
+from common.schema import (
     DisableHooksOnToken,
     GenerationConfigDict,
     ToggleHooksWithDelay,
@@ -228,6 +229,7 @@ def generate_completions(
 
     # Strip the prompt prefix so we only decode new tokens
     gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
+    print(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for idx, gen in enumerate(gen_tail):
         completions.append(
@@ -308,6 +310,7 @@ def generate_completions_early_stop(
 
     # Strip the prompt prefix so we only decode new tokens
     gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
+    print(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for idx, gen in enumerate(gen_tail):
         completions.append(
@@ -393,6 +396,7 @@ def generate_completions_delay(
 
     # Keep only the generated tail
     gen_tail = generation_toks[:, tokenized.input_ids.shape[-1]:]
+    print(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for i, gen in enumerate(gen_tail):
         completions.append({
@@ -568,8 +572,12 @@ def main() -> None:
             print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
             print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
             print("_" * 100)
-        answer_dict[target_degree][instructions_test[i]] = completions
+        answer_dict[target_degree][i] = completions
 
+    # Save answer_dict to json
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    with open(args.output_dir / f"angular_steering_{args.generation_type}.json", "w") as f:
+        json.dump(answer_dict, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
     main()
