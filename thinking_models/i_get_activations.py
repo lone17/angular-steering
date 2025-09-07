@@ -2,7 +2,7 @@ import argparse
 import functools
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 from jaxtyping import Float
@@ -161,7 +161,7 @@ def preprocess_instructions(instructions: list[str]) -> list[str]:
 
 # Save mean activations to disk for backup
 def save_tensor(
-    tensor: Tensor,
+    tensor: Tensor | dict[str, Any],
     file_path: Path,
 ) -> None:
     torch.save(tensor, file_path)

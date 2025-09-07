@@ -28,6 +28,12 @@ from .common.utility import (
 )
 
 from .common.enum import GenerationType
+from .common.schema import (
+    DisableHooksOnToken,
+    GenerationConfigDict,
+    ToggleHooksWithDelay,
+)
+
 
 UPPERBOUND_MAX_NEW_TOKENS = 16000
 DEVICE = "auto"
@@ -141,32 +147,28 @@ def get_angular_steering_output_hook(
     return hook_fn
 
 
-def load_candidate_steering_vectors(output_path: Path) -> tuple[Tensor, Tensor]:
-    candidate_vectors_path = output_path / "candidate_steering_vectors.pt"
-    candidate_vectors_normed_path = output_path / "candidate_steering_vectors_normed.pt"
-    if not candidate_vectors_path.exists() or not candidate_vectors_normed_path.exists():
-        raise FileNotFoundError()
-
-    candidate_steering_vectors = torch.load(candidate_vectors_path)
-    candidate_steering_vectors_normed = torch.load(candidate_vectors_normed_path)
-    return candidate_steering_vectors, candidate_steering_vectors_normed
-
-
 def calculate_basis(
-    output_path: Path, extraction_point: int = EXTRACTION_POINT
+    pre_computed_steering_vectors_path: Path,
+    extraction_point: int = EXTRACTION_POINT
 ) -> tuple[np.ndarray, np.ndarray]:
-    steering_dirs, _ = load_candidate_steering_vectors(output_path)
 
-    steering_dirs_flatten = steering_dirs.reshape((-1, steering_dirs.shape[-1])).cpu().numpy()
-    steering_dir = steering_dirs_flatten[extraction_point]
-    steering_dir_np = steering_dir
+    if not pre_computed_steering_vectors_path.exists():
+        raise FileNotFoundError(pre_computed_steering_vectors_path)
 
-    first_basis = steering_dir_np / np.linalg.norm(steering_dir_np)
+    steering_vectors = torch.load(pre_computed_steering_vectors_path)
+
+    steering_vectors_flatten = steering_vectors.reshape(
+        (-1, steering_vectors.shape[-1])
+    ).cpu().numpy()
+    steering_vector = steering_vectors_flatten[extraction_point]
+    steering_vector_np = steering_vector
+
+    first_basis = steering_vector_np / np.linalg.norm(steering_vector_np)
     print(f"First basis: {first_basis}")
     print(f"First basis - shape: {first_basis.shape}")
 
     pca = PCA()
-    pca.fit(steering_dirs_flatten)
+    pca.fit(steering_vectors_flatten)
 
     # Get the principal components
     principal_components = pca.components_
@@ -203,11 +205,11 @@ def generate_completions(
     fwd_hooks: List[Tuple[nn.Module, Callable]] = [],
     max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
 ) -> List[Dict[str, str]]:
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
+    generation_config = GenerationConfigDict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
     completions = []
 
@@ -255,11 +257,11 @@ def generate_completions_early_stop(
     Generation itself keeps going; only hooks stop being applied.
     """
 
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
+    generation_config = GenerationConfigDict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
     # --- shared gating state ---
     shared = {"hooks_enabled": True}
@@ -283,21 +285,6 @@ def generate_completions_early_stop(
 
     gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
     gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
-
-    # Custom stopping criteria that *disables hooks* once the token appears.
-    class DisableHooksOnToken(StoppingCriteria):
-        def __init__(self, token_id: int, shared_state: dict):
-            self.token_id = token_id
-            self.shared_state = shared_state
-            self.tripped = False
-
-        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-            # input_ids: [batch, cur_len]. Check last generated token.
-            if not self.tripped and (input_ids[:, -1] == self.token_id).any():
-                self.shared_state["hooks_enabled"] = False
-                self.tripped = True
-            # Never stop generation; we only toggle hooks.
-            return False
 
     stopping = StoppingCriteriaList([DisableHooksOnToken(disable_token_id, shared)])
 
@@ -352,11 +339,11 @@ def generate_completions_delay(
     Hooks are OFF during prefill and until the delayed window begins. Generation itself never stops due to this gating.
     """
 
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
+    generation_config = GenerationConfigDict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
 
     # ---- shared gate state (global across the batch) ----
@@ -384,39 +371,6 @@ def generate_completions_delay(
 
     gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
     gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
-
-    # StoppingCriteria that *doesn't* stop generation; it just updates the gate each step.
-    class ToggleHooksWithDelay(StoppingCriteria):
-        def __init__(self, start_id: int, end_id: int, state: dict, delay_n: int):
-            self.start = start_id
-            self.end   = end_id
-            self.state = state
-            self.delay = max(int(delay_n), 0)
-
-        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-            # input_ids: [batch, cur_len]; check last generated token in this step
-            last_ids = input_ids[:, -1]
-
-            # If we see the start token for the first time, arm the delay window
-            if not self.state["seen_start"] and (last_ids == self.start).any():
-                self.state["seen_start"] = True
-                self.state["delay_count"] = 0
-                self.state["enabled"] = False  # still OFF until delay elapses
-
-            # If we already saw start and haven't seen end, step the delay counter
-            if self.state["seen_start"] and not self.state["seen_end"]:
-                # Only increment while not yet enabled
-                if not self.state["enabled"]:
-                    self.state["delay_count"] += 1
-                    if self.state["delay_count"] >= self.delay:
-                        self.state["enabled"] = True  # turn hooks ON after waiting delay_n tokens
-
-            # If we see the end token, turn hooks OFF
-            if not self.state["seen_end"] and (last_ids == self.end).any():
-                self.state["seen_end"] = True
-                self.state["enabled"] = False
-
-            return False  # never stop generation here
 
     stopping = StoppingCriteriaList([ToggleHooksWithDelay(start_token_id, end_token_id, gate, start_delay_n)])
 
@@ -493,10 +447,15 @@ def parse_args() -> argparse.Namespace:
         help="Module names to extract activations from",
     )
     parser.add_argument(
-        "--extraction_point",
+        "--steering_vectors_path",
+        type=Path,
+        help="Path to the file of pre-computed candidate steering vectors",
+    )
+    parser.add_argument(
+        "--chosen_extraction_point",
         type=int,
-        default=52,
-        help="Layers to extract activations from (default: 52 for Qwen3-4B)",
+        default=EXTRACTION_POINT,
+        help="The index of the extraction point corresponding to the chosen steering vector",
     )
     parser.add_argument(
         "-s",
@@ -548,26 +507,32 @@ def main() -> None:
         random_seed=args.random_seed
     )
 
-    first_basis, second_basis = calculate_basis(args.output_dir, extraction_point=args.extraction_point)
+    first_basis, second_basis = calculate_basis(
+        pre_computed_steering_vectors_path=Path(args.steering_vectors_path),
+        extraction_point=args.chosen_extraction_point
+    )
 
     module_dict = dict(model.named_modules())
     module_names = args.module_names
-    module_name_list = [f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names]
+    module_name_list = [
+        f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names
+    ]
 
     print("STARTING ANGULAR STEERING EXPERIMENTS")
     print("=" * 100)
 
-    answer_dict: Dict[int, Dict[str, Dict[str, str]]] = {}
+    answer_dict: Dict[int, Dict[str, List[Dict[str, str]]]] = {}
 
-    if args.generation_type == GenerationType.DEFAULT:
-        generate_completions_fn = generate_completions
-    elif args.generation_type == GenerationType.EARLY_STOP:
-        generate_completions_fn = generate_completions_early_stop
-    elif args.generation_type == GenerationType.DELAY:
-        generate_completions_fn = generate_completions_delay
-    else:   
-        raise ValueError(f"Invalid generation type: {args.generation_type}")
-    
+    match args.generation_type:
+        case GenerationType.DEFAULT:
+            generate_completions_fn = generate_completions
+        case GenerationType.EARLY_STOP:
+            generate_completions_fn = generate_completions_early_stop
+        case GenerationType.DELAY:
+            generate_completions_fn = generate_completions_delay
+        case _:
+            raise ValueError(f"Invalid generation type: {args.generation_type}")
+
     for target_degree in args.target_angle:
         answer_dict[target_degree] = {} # type: ignore
         output_hooks = [
