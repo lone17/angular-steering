@@ -1,6 +1,6 @@
 #!/bin/bash
 
-UPPERBOUND_MAX_NEW_TOKENS=32000
+UPPERBOUND_MAX_NEW_TOKENS={UPPERBOUND_MAX_NEW_TOKENS:-32000}
 
 python i_get_activations.py \
     --model_id Qwen/Qwen3-4B \
