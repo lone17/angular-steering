@@ -1,36 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Callable, Dict, Generator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import argparse
 import functools
 import random
+import json
 
 import numpy as np
 import torch
+import torch.nn as nn
 from jaxtyping import Float
 from sklearn.decomposition import PCA
 from torch import Tensor
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    GenerationConfig,
     StoppingCriteria,
     StoppingCriteriaList,
 )
 
-from utility import (
+from common.utility import (
     add_hooks,
     get_dataset_instructions,
     load_model_and_tokenizer,
     tokenize_instructions_qwen_chat,
 )
-from messages import messages, eval_messages
+
+from common.enum import GenerationType
+from common.schema import (
+    DisableHooksOnToken,
+    GenerationConfigDict,
+    ToggleHooksWithDelay,
+)
 
 
-UPPERBOUND_MAX_NEW_TOKENS = 3000
+UPPERBOUND_MAX_NEW_TOKENS = 16000
 DEVICE = "auto"
 MODEL_ID = "Qwen/Qwen3-4B"
 MODEL_NAME = MODEL_ID.split("/")[-1]
@@ -42,10 +48,10 @@ EXTRACTION_POINT = 52
 
 
 def _get_rotation_args(
-    first_directions: torch.Tensor,
-    second_directions: Optional[torch.Tensor],
+    first_directions: Tensor,
+    second_directions: Optional[Tensor],
     target_degree: float,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[Tensor | None, Tensor | None]:
     """Compute the rotated component with respect to a 2D subspace and an rotation
     angle."""
 
@@ -87,11 +93,11 @@ def _get_rotation_args(
 
 
 def get_angular_steering_output_hook(
-    first_direction,
-    second_direction,
+    first_direction: np.ndarray,
+    second_direction: np.ndarray,
     target_degree: float,
     adaptive_mode: int = 1,
-):
+) -> Callable[[nn.Module, Tuple[Any, ...], Any], Any]:
     first_dir = torch.from_numpy(first_direction)
     second_dir = torch.from_numpy(second_direction)
     proj_matrix, rotated_component = _get_rotation_args(
@@ -142,25 +148,28 @@ def get_angular_steering_output_hook(
     return hook_fn
 
 
-def load_candidate_vectors(output_path: Path):
-    candidate_refusal_vectors = torch.load(f"{output_path}/candidate_refusal_vectors.pt")
-    candidate_refusal_vectors_normed = torch.load(f"{output_path}/candidate_refusal_vectors_normed.pt")
-    return candidate_refusal_vectors, candidate_refusal_vectors_normed
+def calculate_basis(
+    pre_computed_steering_vectors_path: Path,
+    extraction_point: int = EXTRACTION_POINT
+) -> tuple[np.ndarray, np.ndarray]:
 
+    if not pre_computed_steering_vectors_path.exists():
+        raise FileNotFoundError(pre_computed_steering_vectors_path)
 
-def calculate_basis(output_path: Path, extraction_point: int = EXTRACTION_POINT):
-    refusal_dirs, _ = load_candidate_vectors(output_path)
+    steering_vectors = torch.load(pre_computed_steering_vectors_path)
 
-    refusal_dirs_flatten = refusal_dirs.reshape((-1, refusal_dirs.shape[-1])).cpu().numpy()
-    refusal_dir = refusal_dirs_flatten[extraction_point]
-    refusal_dir_np = refusal_dir
+    steering_vectors_flatten = steering_vectors.reshape(
+        (-1, steering_vectors.shape[-1])
+    ).cpu().numpy()
+    steering_vector = steering_vectors_flatten[extraction_point]
+    steering_vector_np = steering_vector
 
-    first_basis = refusal_dir_np / np.linalg.norm(refusal_dir_np)
+    first_basis = steering_vector_np / np.linalg.norm(steering_vector_np)
     print(f"First basis: {first_basis}")
     print(f"First basis - shape: {first_basis.shape}")
 
     pca = PCA()
-    pca.fit(refusal_dirs_flatten)
+    pca.fit(steering_vectors_flatten)
 
     # Get the principal components
     principal_components = pca.components_
@@ -193,15 +202,15 @@ def generate_completions(
     tokenizer: AutoTokenizer,
     tokenize_instructions_fn: Callable,
     system_prompt: Optional[str] = None,
-    fwd_pre_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
-    fwd_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
-    max_new_tokens: int = 3000,
-):
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
+    fwd_pre_hooks: List[Tuple[nn.Module, Callable]] = [],
+    fwd_hooks: List[Tuple[nn.Module, Callable]] = [],
+    max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
+) -> List[Dict[str, str]]:
+    generation_config = GenerationConfigDict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
     completions = []
 
@@ -220,6 +229,7 @@ def generate_completions(
 
     # Strip the prompt prefix so we only decode new tokens
     gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
+    print(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for idx, gen in enumerate(gen_tail):
         completions.append(
@@ -238,22 +248,22 @@ def generate_completions_early_stop(
     tokenizer: AutoTokenizer,
     tokenize_instructions_fn: Callable,
     system_prompt: Optional[str] = None,
-    fwd_pre_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
-    fwd_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
-    max_new_tokens: int = 3000,
+    fwd_pre_hooks: List[Tuple[nn.Module, Callable]] = [],
+    fwd_hooks: List[Tuple[nn.Module, Callable]] = [],
+    max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
     disable_token_id: int = 151668,     # stop applying hooks AFTER this id appears
-):
+) -> List[Dict[str, str]]:
     """
     Runs HF generate() with your hooks, but disables all hooks as soon as
     the token `disable_token_id` is generated (for any sequence in the batch).
     Generation itself keeps going; only hooks stop being applied.
     """
 
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
+    generation_config = GenerationConfigDict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
     # --- shared gating state ---
     shared = {"hooks_enabled": True}
@@ -278,21 +288,6 @@ def generate_completions_early_stop(
     gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
     gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
 
-    # Custom stopping criteria that *disables hooks* once the token appears.
-    class DisableHooksOnToken(StoppingCriteria):
-        def __init__(self, token_id: int, shared_state: dict):
-            self.token_id = token_id
-            self.shared_state = shared_state
-            self.tripped = False
-
-        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-            # input_ids: [batch, cur_len]. Check last generated token.
-            if not self.tripped and (input_ids[:, -1] == self.token_id).any():
-                self.shared_state["hooks_enabled"] = False
-                self.tripped = True
-            # Never stop generation; we only toggle hooks.
-            return False
-
     stopping = StoppingCriteriaList([DisableHooksOnToken(disable_token_id, shared)])
 
     completions = []
@@ -315,6 +310,7 @@ def generate_completions_early_stop(
 
     # Strip the prompt prefix so we only decode new tokens
     gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
+    print(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for idx, gen in enumerate(gen_tail):
         completions.append(
@@ -333,24 +329,24 @@ def generate_completions_delay(
     tokenizer: AutoTokenizer,
     tokenize_instructions_fn: Callable,
     system_prompt: Optional[str] = None,
-    fwd_pre_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
-    fwd_hooks: List[Tuple[torch.nn.Module, Callable]] = [],
-    max_new_tokens: int = 3000,
+    fwd_pre_hooks: List[Tuple[nn.Module, Callable]] = [],
+    fwd_hooks: List[Tuple[nn.Module, Callable]] = [],
+    max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
     start_token_id: int = 151667,      # turn ON window after this appears
     end_token_id: int = 151668,        # turn OFF after this appears
     start_delay_n: int = 100,            # number of tokens to wait after start before enabling hooks
-):
+) -> List[Dict[str, str]]:
     """
     Hooks are applied only in the window:
         (start_token_id) --[wait start_delay_n tokens]-->  (hooks ON)  ... until (end_token_id) --> (hooks OFF)
     Hooks are OFF during prefill and until the delayed window begins. Generation itself never stops due to this gating.
     """
 
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
+    generation_config = GenerationConfigDict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+    )
 
 
     # ---- shared gate state (global across the batch) ----
@@ -379,39 +375,6 @@ def generate_completions_delay(
     gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
     gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
 
-    # StoppingCriteria that *doesn't* stop generation; it just updates the gate each step.
-    class ToggleHooksWithDelay(StoppingCriteria):
-        def __init__(self, start_id: int, end_id: int, state: dict, delay_n: int):
-            self.start = start_id
-            self.end   = end_id
-            self.state = state
-            self.delay = max(int(delay_n), 0)
-
-        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-            # input_ids: [batch, cur_len]; check last generated token in this step
-            last_ids = input_ids[:, -1]
-
-            # If we see the start token for the first time, arm the delay window
-            if not self.state["seen_start"] and (last_ids == self.start).any():
-                self.state["seen_start"] = True
-                self.state["delay_count"] = 0
-                self.state["enabled"] = False  # still OFF until delay elapses
-
-            # If we already saw start and haven't seen end, step the delay counter
-            if self.state["seen_start"] and not self.state["seen_end"]:
-                # Only increment while not yet enabled
-                if not self.state["enabled"]:
-                    self.state["delay_count"] += 1
-                    if self.state["delay_count"] >= self.delay:
-                        self.state["enabled"] = True  # turn hooks ON after waiting delay_n tokens
-
-            # If we see the end token, turn hooks OFF
-            if not self.state["seen_end"] and (last_ids == self.end).any():
-                self.state["seen_end"] = True
-                self.state["enabled"] = False
-
-            return False  # never stop generation here
-
     stopping = StoppingCriteriaList([ToggleHooksWithDelay(start_token_id, end_token_id, gate, start_delay_n)])
 
     completions = []
@@ -433,6 +396,7 @@ def generate_completions_delay(
 
     # Keep only the generated tail
     gen_tail = generation_toks[:, tokenized.input_ids.shape[-1]:]
+    print(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for i, gen in enumerate(gen_tail):
         completions.append({
@@ -453,7 +417,7 @@ def set_reproducibility(seed: int = 42) -> None:
     torch.manual_seed(seed)
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Get activations from language model")
     parser.add_argument(
         "--model_id", type=str, default=MODEL_ID, help="Model name or path"
@@ -487,10 +451,15 @@ def parse_args():
         help="Module names to extract activations from",
     )
     parser.add_argument(
-        "--extraction_point",
+        "--steering_vectors_path",
+        type=Path,
+        help="Path to the file of pre-computed candidate steering vectors",
+    )
+    parser.add_argument(
+        "--chosen_extraction_point",
         type=int,
-        default=52,
-        help="Layers to extract activations from (default: 52 for Qwen3-4B)",
+        default=EXTRACTION_POINT,
+        help="The index of the extraction point corresponding to the chosen steering vector",
     )
     parser.add_argument(
         "-s",
@@ -515,8 +484,8 @@ def parse_args():
     )
     parser.add_argument(
         "--generation_type",
-        type=str,
-        default="default",
+        type=GenerationType,
+        default=GenerationType.DEFAULT,
         help="Type of generation to use (default, early_stop or delay)",
     )
     return parser.parse_args()
@@ -542,28 +511,34 @@ def main() -> None:
         random_seed=args.random_seed
     )
 
-    first_basis, second_basis = calculate_basis(args.output_dir, extraction_point=args.extraction_point)
+    first_basis, second_basis = calculate_basis(
+        pre_computed_steering_vectors_path=Path(args.steering_vectors_path),
+        extraction_point=args.chosen_extraction_point
+    )
 
     module_dict = dict(model.named_modules())
     module_names = args.module_names
-    module_name_list = [f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names]
+    module_name_list = [
+        f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names
+    ]
 
     print("STARTING ANGULAR STEERING EXPERIMENTS")
     print("=" * 100)
 
-    answer_dict = {}
+    answer_dict: Dict[int, Dict[str, List[Dict[str, str]]]] = {}
 
-    if args.generation_type == "default":
-        generate_completions_fn = generate_completions
-    elif args.generation_type == "early_stop":
-        generate_completions_fn = generate_completions_early_stop
-    elif args.generation_type == "delay":
-        generate_completions_fn = generate_completions_delay
-    else:   
-        raise ValueError(f"Invalid generation type: {args.generation_type}")
-    
+    match args.generation_type:
+        case GenerationType.DEFAULT:
+            generate_completions_fn = generate_completions
+        case GenerationType.EARLY_STOP:
+            generate_completions_fn = generate_completions_early_stop
+        case GenerationType.DELAY:
+            generate_completions_fn = generate_completions_delay
+        case _:
+            raise ValueError(f"Invalid generation type: {args.generation_type}")
+
     for target_degree in args.target_angle:
-        answer_dict[target_degree] = {}
+        answer_dict[target_degree] = {} # type: ignore
         output_hooks = [
             (
                 module_dict[module_name],
@@ -597,8 +572,12 @@ def main() -> None:
             print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
             print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
             print("_" * 100)
-        answer_dict[target_degree][instructions_test[i]] = completions
+        answer_dict[target_degree][i] = completions
 
+    # Save answer_dict to json
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    with open(args.output_dir / f"angular_steering_{args.generation_type}.json", "w") as f:
+        json.dump(answer_dict, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
     main()

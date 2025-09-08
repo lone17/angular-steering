@@ -1,16 +1,15 @@
 import argparse
-import contextlib
 import functools
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Generator, Optional
+from typing import Any, Callable
 
 import torch
 from jaxtyping import Float
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utility import (
+from common.utility import (
     add_hooks,
     get_dataset_instructions,
     load_model_and_tokenizer,
@@ -162,7 +161,7 @@ def preprocess_instructions(instructions: list[str]) -> list[str]:
 
 # Save mean activations to disk for backup
 def save_tensor(
-    tensor: Tensor,
+    tensor: Tensor | dict[str, Any],
     file_path: Path,
 ) -> None:
     torch.save(tensor, file_path)
