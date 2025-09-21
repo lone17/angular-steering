@@ -111,7 +111,8 @@ def get_prompt_token_activations(
                 tokens.attention_mask.to(model.device),
             )
 
-    assert tokens.input_ids.shape[-1] == step_activations[target_module_paths[0]].shape[-1]
+    # Number of prompt tokens must match the second dim of per-module tensor
+    assert tokens.input_ids.shape[-1] == step_activations[target_module_paths[0]].shape[1]
     return step_activations
 
 
