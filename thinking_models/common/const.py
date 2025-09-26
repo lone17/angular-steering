@@ -1,3 +1,30 @@
+EXTRACTION_POINT_ID = {
+    "Qwen/Qwen3-4B": {
+        "s1_start_n_end": "input_layernorm_26",
+        "s2_start_2_n_end_2": "input_layernorm_29",
+        "s3_mean_thinking_n_mean_answer": "input_layernorm_23",
+        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_21",
+    },
+    "Qwen/Qwen3-8B": {
+        "s1_start_n_end": "input_layernorm_29",
+        "s2_start_2_n_end_2": "input_layernorm_28",
+        "s3_mean_thinking_n_mean_answer": "input_layernorm_23",
+        "s4_vanilla_n_fast_thinking": "input_layernorm_28",
+    },
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": {
+        "s1_start_n_end": "post_attention_layernorm_12",
+        "s2_start_2_n_end_2": "post_attention_layernorm_18",
+        "s3_mean_thinking_n_mean_answer": "post_attention_layernorm_21",
+        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_17",
+    },
+    "deepseek-ai/DeepSeek-R1-Distill-LLama-8B": {
+        "s1_start_n_end": "input_layernorm_23",
+        "s2_start_2_n_end_2": "post_attention_layernorm_22",
+        "s3_mean_thinking_n_mean_answer": "post_attention_layernorm_20",
+        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_26",
+    },
+}
+
 # index of the first 256 samples (shuffled with seed 42) sorted by genreation length
 ORDER_BY_LENGTH = [
     209,
@@ -257,3 +284,24 @@ ORDER_BY_LENGTH = [
     245,
     250,
 ]
+
+# baseline
+# 0
+
+# 30
+# 60
+
+# 90
+# 120
+
+# 150
+
+# 180
+
+# 210
+
+# 240
+# 270
+
+# 300
+# 330
