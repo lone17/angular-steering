@@ -1,7 +1,11 @@
-import torch
-import json
 import argparse
+import json
+import os
+
 from pathlib import Path
+
+import torch
+
 from tqdm import tqdm
 
 REQUIRED_KEYS = ["prompt", "response", "generated_token_ids", "token_activations"]
@@ -19,11 +23,11 @@ def get_sample_idx_from_file_path(file_path: str) -> int:
 def split_sequences_activations(act_path: str, output_dir: str, remove_original: bool = False) -> tuple:
     data = load_sequences_activations(act_path)
     sample_idx = get_sample_idx_from_file_path(act_path)
-    
+
     data_keys = list(data.keys())
     if not all([key in data_keys for key in REQUIRED_KEYS]):
         raise ValueError(f"Sequences activations must contain the following keys: {REQUIRED_KEYS}, got {data_keys}")
-    
+
     generated_token_acts = data.pop("token_activations")
 
     generated_pt_path = output_dir / f"generation_activations_{sample_idx}.pt"

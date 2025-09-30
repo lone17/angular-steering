@@ -1,19 +1,34 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import argparse
 import functools
-import random
 import json
+import logging
+import random
+from pathlib import Path
+from pprint import pprint
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from functools import cache
 
 import numpy as np
 import torch
 import torch.nn as nn
+from common.enum import GenerationType
+from common.schema import (
+    DisableHooksOnToken,
+    GenerationConfigDict,
+    ToggleHooksWithDelay,
+)
+from common.utility import (
+    add_hooks,
+    get_dataset_instructions,
+    load_model_and_tokenizer,
+    tokenize_instructions_qwen_chat,
+)
 from jaxtyping import Float
 from sklearn.decomposition import PCA
 from torch import Tensor
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -21,20 +36,8 @@ from transformers import (
     StoppingCriteriaList,
 )
 
-from common.utility import (
-    add_hooks,
-    get_dataset_instructions,
-    load_model_and_tokenizer,
-    tokenize_instructions_qwen_chat,
-)
-
-from common.enum import GenerationType
-from common.schema import (
-    DisableHooksOnToken,
-    GenerationConfigDict,
-    ToggleHooksWithDelay,
-)
-
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 UPPERBOUND_MAX_NEW_TOKENS = 16000
 DEVICE = "auto"
@@ -42,9 +45,10 @@ MODEL_ID = "Qwen/Qwen3-4B"
 MODEL_NAME = MODEL_ID.split("/")[-1]
 RANDOM_SEED = 42
 OUTPUT_ROOT = Path("outputs")
-OUTPUT_DIR = OUTPUT_ROOT / MODEL_NAME
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 EXTRACTION_POINT = 52
+
+
+ROTATION_ARGS_CACHE: Dict[Tuple[Tuple, Tuple, float], Tuple[Tensor, Tensor]] = {}
 
 
 def _get_rotation_args(
@@ -54,12 +58,17 @@ def _get_rotation_args(
 ) -> tuple[Tensor | None, Tensor | None]:
     """Compute the rotated component with respect to a 2D subspace and an rotation
     angle."""
+    # first_direction: (batch) x hidden_dim
+    # second_directions: (batch) x hidden_dim
 
     if second_directions is None:
         return None, None
 
-    # first_direction: (batch) x hidden_dim
-    # second_directions: (batch) x hidden_dim
+    hash_first = tuple(first_directions.cpu().numpy().tolist())
+    hash_second = tuple(second_directions.cpu().numpy().tolist())
+    cache_key = (hash_first, hash_second, target_degree)
+    if cache_key in ROTATION_ARGS_CACHE:
+        return ROTATION_ARGS_CACHE[cache_key]
 
     # ensure bases are orthonormal
     b1 = first_directions / first_directions.norm(dim=-1, keepdim=True)
@@ -89,6 +98,8 @@ def _get_rotation_args(
         uv @ R_theta @ torch.tensor([1, 0], device=uv.device, dtype=uv.dtype)
     )
 
+    ROTATION_ARGS_CACHE[cache_key] = (proj_matrix, rotated_component)
+
     return proj_matrix, rotated_component
 
 
@@ -112,8 +123,8 @@ def get_angular_steering_output_hook(
             activation: Float[Tensor, "batch_size seq_len d_model"] = output[0]
         else:
             activation: Float[Tensor, "batch_size seq_len d_model"] = output
-        first_dir = torch.from_numpy(first_direction)
-        second_dir = torch.from_numpy(second_direction)
+        first_dir = first_dir.to(activation)
+        second_dir = second_dir.to(activation)
         proj_matrix = proj_matrix.to(activation)
         rotated_component = rotated_component.to(activation)
         Px = torch.einsum("...i, ...ij -> ...j", activation, proj_matrix)
@@ -149,8 +160,7 @@ def get_angular_steering_output_hook(
 
 
 def calculate_basis(
-    pre_computed_steering_vectors_path: Path,
-    extraction_point: int = EXTRACTION_POINT
+    pre_computed_steering_vectors_path: Path, extraction_point: int = EXTRACTION_POINT
 ) -> tuple[np.ndarray, np.ndarray]:
 
     if not pre_computed_steering_vectors_path.exists():
@@ -158,9 +168,9 @@ def calculate_basis(
 
     steering_vectors = torch.load(pre_computed_steering_vectors_path)
 
-    steering_vectors_flatten = steering_vectors.reshape(
-        (-1, steering_vectors.shape[-1])
-    ).cpu().numpy()
+    steering_vectors_flatten = (
+        steering_vectors.reshape((-1, steering_vectors.shape[-1])).cpu().numpy()
+    )
     steering_vector = steering_vectors_flatten[extraction_point]
     steering_vector_np = steering_vector
 
@@ -217,10 +227,13 @@ def generate_completions(
     tokenized_instructions = tokenize_instructions_fn(
         instructions=instructions, system_prompt=system_prompt
     )
-    
-    with add_hooks(
-        module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks
-    ), torch.inference_mode():
+
+    with (
+        add_hooks(
+            module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks
+        ),
+        torch.inference_mode(),
+    ):
         generation_toks = model.generate(
             input_ids=tokenized_instructions.input_ids.to(model.device),
             attention_mask=tokenized_instructions.attention_mask.to(model.device),
@@ -228,8 +241,8 @@ def generate_completions(
         )
 
     # Strip the prompt prefix so we only decode new tokens
-    gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
-    print(f"Number of generated tokens: {len(gen_tail[0])}")
+    gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1] :]
+    logger.info(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for idx, gen in enumerate(gen_tail):
         completions.append(
@@ -251,7 +264,7 @@ def generate_completions_early_stop(
     fwd_pre_hooks: List[Tuple[nn.Module, Callable]] = [],
     fwd_hooks: List[Tuple[nn.Module, Callable]] = [],
     max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
-    disable_token_id: int = 151668,     # stop applying hooks AFTER this id appears
+    disable_token_id: int = 151668,  # stop applying hooks AFTER this id appears
 ) -> List[Dict[str, str]]:
     """
     Runs HF generate() with your hooks, but disables all hooks as soon as
@@ -275,6 +288,7 @@ def generate_completions_early_stop(
             if not shared["hooks_enabled"]:
                 return None
             return h(module, *args, **kwargs)
+
         return wrapped
 
     # For forward hooks: return None when disabled (means "keep original output").
@@ -283,9 +297,10 @@ def generate_completions_early_stop(
             if not shared["hooks_enabled"]:
                 return None
             return h(module, *args, **kwargs)
+
         return wrapped
 
-    gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
+    gated_pre_hooks = [(m, gate_pre(h)) for (m, h) in fwd_pre_hooks]
     gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
 
     stopping = StoppingCriteriaList([DisableHooksOnToken(disable_token_id, shared)])
@@ -297,20 +312,23 @@ def generate_completions_early_stop(
         instructions=instructions, system_prompt=system_prompt
     )
     # Register hooks for the whole generate() call; they self-disable via `shared`.
-    with add_hooks(
-        module_forward_pre_hooks=gated_pre_hooks,
-        module_forward_hooks=gated_post_hooks,
-    ), torch.inference_mode():
+    with (
+        add_hooks(
+            module_forward_pre_hooks=gated_pre_hooks,
+            module_forward_hooks=gated_post_hooks,
+        ),
+        torch.inference_mode(),
+    ):
         generation_toks = model.generate(
             input_ids=tokenized_instructions.input_ids.to(model.device),
             attention_mask=tokenized_instructions.attention_mask.to(model.device),
-            stopping_criteria=stopping,   # <-- flips hooks off at the right moment
+            stopping_criteria=stopping,  # <-- flips hooks off at the right moment
             **generation_config,
         )
 
     # Strip the prompt prefix so we only decode new tokens
-    gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1]:]
-    print(f"Number of generated tokens: {len(gen_tail[0])}")
+    gen_tail = generation_toks[:, tokenized_instructions.input_ids.shape[-1] :]
+    logger.info(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for idx, gen in enumerate(gen_tail):
         completions.append(
@@ -332,9 +350,9 @@ def generate_completions_delay(
     fwd_pre_hooks: List[Tuple[nn.Module, Callable]] = [],
     fwd_hooks: List[Tuple[nn.Module, Callable]] = [],
     max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
-    start_token_id: int = 151667,      # turn ON window after this appears
-    end_token_id: int = 151668,        # turn OFF after this appears
-    start_delay_n: int = 100,            # number of tokens to wait after start before enabling hooks
+    start_token_id: int = 151667,  # turn ON window after this appears
+    end_token_id: int = 151668,  # turn OFF after this appears
+    start_delay_n: int = 100,  # number of tokens to wait after start before enabling hooks
 ) -> List[Dict[str, str]]:
     """
     Hooks are applied only in the window:
@@ -348,13 +366,12 @@ def generate_completions_delay(
         pad_token_id=tokenizer.pad_token_id,
     )
 
-
     # ---- shared gate state (global across the batch) ----
     gate = {
-        "enabled": False,          # whether hooks should currently run
-        "seen_start": False,       # have we seen start_token_id yet?
-        "seen_end": False,         # have we seen end_token_id yet?
-        "delay_count": 0,          # how many tokens since start we have generated
+        "enabled": False,  # whether hooks should currently run
+        "seen_start": False,  # have we seen start_token_id yet?
+        "seen_end": False,  # have we seen end_token_id yet?
+        "delay_count": 0,  # how many tokens since start we have generated
     }
 
     # Wrap your hooks to obey the gate
@@ -363,6 +380,7 @@ def generate_completions_delay(
             if not gate["enabled"]:
                 return None  # no-op for pre-hooks
             return h(module, *args, **kwargs)
+
         return wrapped
 
     def gate_post(h):
@@ -370,12 +388,15 @@ def generate_completions_delay(
             if not gate["enabled"]:
                 return None  # no-op for post-hooks (keeps original output)
             return h(module, *args, **kwargs)
+
         return wrapped
 
-    gated_pre_hooks  = [(m, gate_pre(h))  for (m, h) in fwd_pre_hooks]
+    gated_pre_hooks = [(m, gate_pre(h)) for (m, h) in fwd_pre_hooks]
     gated_post_hooks = [(m, gate_post(h)) for (m, h) in fwd_hooks]
 
-    stopping = StoppingCriteriaList([ToggleHooksWithDelay(start_token_id, end_token_id, gate, start_delay_n)])
+    stopping = StoppingCriteriaList(
+        [ToggleHooksWithDelay(start_token_id, end_token_id, gate, start_delay_n)]
+    )
 
     completions = []
 
@@ -395,15 +416,18 @@ def generate_completions_delay(
             )
 
     # Keep only the generated tail
-    gen_tail = generation_toks[:, tokenized.input_ids.shape[-1]:]
-    print(f"Number of generated tokens: {len(gen_tail[0])}")
+    gen_tail = generation_toks[:, tokenized.input_ids.shape[-1] :]
+    logger.info(f"Number of generated tokens: {len(gen_tail[0])}")
 
     for i, gen in enumerate(gen_tail):
-        completions.append({
-            "prompt": instructions[i],
-            "response": tokenizer.decode(gen, skip_special_tokens=True).strip(),
-        })
+        completions.append(
+            {
+                "prompt": instructions[i],
+                "response": tokenizer.decode(gen, skip_special_tokens=True).strip(),
+            }
+        )
     return completions
+
 
 # -----------------------------
 # Utilities
@@ -438,9 +462,9 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for reproducibility",
     )
     parser.add_argument(
-        "--output_dir",
+        "--root_output_dir",
         type=Path,
-        default=OUTPUT_DIR,
+        default=OUTPUT_ROOT,
         help="Directory to save outputs",
     )
     parser.add_argument(
@@ -451,15 +475,13 @@ def parse_args() -> argparse.Namespace:
         help="Module names to extract activations from",
     )
     parser.add_argument(
-        "--steering_vectors_path",
-        type=Path,
-        help="Path to the file of pre-computed candidate steering vectors",
-    )
-    parser.add_argument(
         "--chosen_extraction_point",
         type=int,
-        default=EXTRACTION_POINT,
-        help="The index of the extraction point corresponding to the chosen steering vector",
+        # default=EXTRACTION_POINT,
+        help=(
+            "The index of the extraction point corresponding to the chosen steering"
+            " vector"
+        ),
     )
     parser.add_argument(
         "-s",
@@ -479,7 +501,7 @@ def parse_args() -> argparse.Namespace:
         "--target_angle",
         type=int,
         nargs="+",
-        default=[90, 120, 180, 200, 240, 270],
+        default=list(range(0, 361, 30)),
         help="Target angles for steering",
     )
     parser.add_argument(
@@ -488,15 +510,51 @@ def parse_args() -> argparse.Namespace:
         default=GenerationType.DEFAULT,
         help="Type of generation to use (default, early_stop or delay)",
     )
+    parser.add_argument(
+        "--extraction_strategy_id",
+        type=str,
+        default="s1_start_n_end",
+        help="The strategy for choosing when to extract activations",
+    )
+    parser.add_argument(
+        "--force_overwrite_output",
+        action="store_true",
+        help="Overwrite the output file if it exists",
+    )
+    parser.add_argument(
+        "--adaptive_mode",
+        type=int,
+        default=0,
+        help=(
+            "Adaptive mode for steering (0: off, 1: adaptive to first basis, 2:"
+            " adaptive to second basis"
+        ),
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    # Parse command-line arguments
-    args = parse_args()
+@cache
+def get_pytorch_infer_func(
+    target_degree,
+    model_id,
+    root_output_dir,
+    extraction_strategy_id,
+    chosen_extraction_point,
+    module_names,
+    generation_type,
+    adaptive_mode,
+    upperbound_max_new_tokens,
+    device,
+):
+    model_name = model_id.split("/")[-1]
+
+    steering_vectors_dir = root_output_dir / "steering-vectors" / model_name
+    steering_vectors_path = (
+        steering_vectors_dir / extraction_strategy_id / "candidate_steering_vectors.pt"
+    )
 
     # Load model and tokenizer with args
-    model, tokenizer = load_model_and_tokenizer(args.model_id, args.device)
+    model, tokenizer = load_model_and_tokenizer(model_id, device)
 
     tokenize_instructions_fn = functools.partial(
         tokenize_instructions_qwen_chat,
@@ -504,30 +562,20 @@ def main() -> None:
         enable_thinking=True,
     )
 
-    # Prepare dataset
-    set_reproducibility(seed=args.random_seed)
-
-    _, instructions_test = get_dataset_instructions(
-        random_seed=args.random_seed
-    )
-
     first_basis, second_basis = calculate_basis(
-        pre_computed_steering_vectors_path=Path(args.steering_vectors_path),
-        extraction_point=args.chosen_extraction_point
+        pre_computed_steering_vectors_path=Path(steering_vectors_path),
+        extraction_point=chosen_extraction_point,
     )
 
     module_dict = dict(model.named_modules())
-    module_names = args.module_names
+    module_names = module_names
     module_name_list = [
-        f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names
+        f"model.layers.{i}.{name}"
+        for i in range(model.config.num_hidden_layers)
+        for name in module_names
     ]
 
-    print("STARTING ANGULAR STEERING EXPERIMENTS")
-    print("=" * 100)
-
-    answer_dict: Dict[int, Dict[str, List[Dict[str, str]]]] = {}
-
-    match args.generation_type:
+    match generation_type:
         case GenerationType.DEFAULT:
             generate_completions_fn = generate_completions
         case GenerationType.EARLY_STOP:
@@ -535,10 +583,12 @@ def main() -> None:
         case GenerationType.DELAY:
             generate_completions_fn = generate_completions_delay
         case _:
-            raise ValueError(f"Invalid generation type: {args.generation_type}")
+            raise ValueError(f"Invalid generation type: {generation_type}")
 
-    for target_degree in args.target_angle:
-        answer_dict[target_degree] = {} # type: ignore
+    if target_degree == "baseline":
+        print("Running baseline (no steering)")
+        output_hooks = []
+    else:
         output_hooks = [
             (
                 module_dict[module_name],
@@ -546,38 +596,190 @@ def main() -> None:
                     first_direction=first_basis,
                     second_direction=second_basis,
                     target_degree=target_degree,
-                    adaptive_mode=0,
+                    adaptive_mode=adaptive_mode,
                 ),
             )
             for module_name in module_name_list
         ]
 
-        for i in range(args.start_index, args.end_index):
-            print(f"\nSteering at {target_degree} degrees")
-            print("-" * 100)
-            print("QUESTION:\n", instructions_test[i])
-            print("ANSWER:")
-            completions = generate_completions_fn(
-                model=model,
-                instructions=[instructions_test[i]],
-                tokenizer=tokenizer,
-                tokenize_instructions_fn=tokenize_instructions_fn,
-                system_prompt=None,
-                # system_prompt="Answer in the most angry, frustrated and aggressive way possible.",
-                # fwd_pre_hooks=fwd_pre_hooks,
-                fwd_hooks=output_hooks,
-                max_new_tokens=args.upperbound_max_new_tokens,
-            )
-            print(completions[0]["response"][:500])
-            print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
-            print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
-            print("_" * 100)
-        answer_dict[target_degree][i] = completions
+    generate_completions_fn = functools.partial(
+        generate_completions_fn,
+        model=model,
+        tokenizer=tokenizer,
+        tokenize_instructions_fn=tokenize_instructions_fn,
+        max_new_tokens=upperbound_max_new_tokens,
+        fwd_pre_hooks=[],
+        fwd_hooks=output_hooks,
+        system_prompt=None,
+    )
 
-    # Save answer_dict to json
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    with open(args.output_dir / f"angular_steering_{args.generation_type}.json", "w") as f:
-        json.dump(answer_dict, f, indent=4, ensure_ascii=False)
+    return generate_completions_fn
+
+
+def main() -> None:
+    # Parse command-line arguments
+    args = parse_args()
+
+    args.model_name = args.model_id.split("/")[-1]
+
+    args.root_output_dir = Path(args.root_output_dir)
+
+    experiment_id = f"{args.generation_type.value}-{args.extraction_strategy_id}-extraction_point_{args.chosen_extraction_point}-adaptive_{args.adaptive_mode}"
+
+    generations_output_dir = (
+        args.root_output_dir
+        / "thinking-steering-generations"
+        / args.model_name
+        / experiment_id
+    )
+    generations_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Prepare dataset
+    set_reproducibility(seed=args.random_seed)
+
+    _, instructions_test = get_dataset_instructions(random_seed=args.random_seed)
+    args.end_index = min(args.end_index, len(instructions_test))
+
+    # steering_vectors_dir = args.root_output_dir / "steering-vectors" / args.model_name
+    # steering_vectors_path = (
+    #     steering_vectors_dir
+    #     / args.extraction_strategy_id
+    #     / "candidate_steering_vectors.pt"
+    # )
+
+    # # Load model and tokenizer with args
+    # model, tokenizer = load_model_and_tokenizer(args.model_id, args.device)
+
+    # tokenize_instructions_fn = functools.partial(
+    #     tokenize_instructions_qwen_chat,
+    #     tokenizer=tokenizer,
+    #     enable_thinking=True,
+    # )
+
+    # first_basis, second_basis = calculate_basis(
+    #     pre_computed_steering_vectors_path=Path(steering_vectors_path),
+    #     extraction_point=args.chosen_extraction_point,
+    # )
+
+    # module_dict = dict(model.named_modules())
+    # module_names = args.module_names
+    # module_name_list = [
+    #     f"model.layers.{i}.{name}"
+    #     for i in range(model.config.num_hidden_layers)
+    #     for name in module_names
+    # ]
+
+    pprint(args.__dict__)
+
+    print("STARTING ANGULAR STEERING EXPERIMENTS")
+    print("=" * 100)
+
+    # match args.generation_type:
+    #     case GenerationType.DEFAULT:
+    #         generate_completions_fn = generate_completions
+    #     case GenerationType.EARLY_STOP:
+    #         generate_completions_fn = generate_completions_early_stop
+    #     case GenerationType.DELAY:
+    #         generate_completions_fn = generate_completions_delay
+    #     case _:
+    #         raise ValueError(f"Invalid generation type: {args.generation_type}")
+
+    time_per_angle = dict()
+
+    for target_degree in args.target_angle:
+
+        generation_output_file = generations_output_dir / f"{target_degree}.json"
+        if generation_output_file.exists() and not args.force_overwrite_output:
+            print(
+                f"Generation output file {generation_output_file} already exists."
+                " Skipping this angle."
+            )
+            continue
+
+        # if target_degree == "baseline":
+        #     print("Running baseline (no steering)")
+        #     output_hooks = []
+        # else:
+        #     output_hooks = [
+        #         (
+        #             module_dict[module_name],
+        #             get_angular_steering_output_hook(
+        #                 first_direction=first_basis,
+        #                 second_direction=second_basis,
+        #                 target_degree=target_degree,
+        #                 adaptive_mode=args.adaptive_mode,
+        #             ),
+        #         )
+        #         for module_name in module_name_list
+        #     ]
+
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+
+        infer_func = get_pytorch_infer_func(
+            target_degree=target_degree,
+            model_id=args.model_id,
+            root_output_dir=args.root_output_dir,
+            extraction_strategy_id=args.extraction_strategy_id,
+            chosen_extraction_point=args.chosen_extraction_point,
+            module_names=tuple(args.module_names),
+            generation_type=args.generation_type,
+            adaptive_mode=args.adaptive_mode,
+            upperbound_max_new_tokens=args.upperbound_max_new_tokens,
+            device=args.device,
+        )
+
+        generation_outputs = dict()
+        start_time.record()
+        for i in tqdm(
+            range(args.start_index, args.end_index),
+            desc=f"Steering at {target_degree} degrees",
+        ):
+            logger.debug("-" * 100)
+            logger.debug(f"QUESTION:\n{instructions_test[i]}")
+            logger.debug("ANSWER:")
+            # completions = generate_completions_fn(
+            #     model=model,
+            #     instructions=[instructions_test[i]],
+            #     tokenizer=tokenizer,
+            #     tokenize_instructions_fn=tokenize_instructions_fn,
+            #     system_prompt=None,
+            #     # system_prompt="Answer in the most angry, frustrated and aggressive way possible.",
+            #     # fwd_pre_hooks=fwd_pre_hooks,
+            #     fwd_hooks=output_hooks,
+            #     max_new_tokens=args.upperbound_max_new_tokens,
+            # )
+            completions = infer_func(instructions=[instructions_test[i]])
+
+            completions = completions[0]
+            logger.debug(completions["response"][:500])
+            logger.debug(
+                "FIRST END THINK TOKEN POSITION:"
+                f" {completions['response'].find('</think>')}"
+            )
+            logger.debug(
+                "LAST END THINK TOKEN POSITION:"
+                f" {completions['response'].rfind('</think>')}"
+            )
+            logger.debug("_" * 100)
+            generation_outputs[i] = completions
+
+        end_time.record()
+
+        torch.cuda.synchronize()
+        processing_time = start_time.elapsed_time(end_time)
+        time_per_angle[target_degree] = processing_time
+
+        # # Save outputs to json at each angle
+        # with open(generation_output_file, "w") as f:
+        #     json.dump(generation_outputs, f, indent=4, ensure_ascii=False)
+        # logger.info(
+        #     f"Saved generations of {target_degree} degrees to {generation_output_file}"
+        # )
+
+    for angle, t in time_per_angle.items():
+        print(f"Time taken for {angle} degrees: {t/1000:.2f} seconds")
+
 
 if __name__ == "__main__":
     main()
