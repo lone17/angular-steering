@@ -1,6 +1,7 @@
 import os
 
 os.environ["VLLM_USE_V1"] = "0"
+import argparse
 import sys
 import time
 from functools import cache
@@ -10,7 +11,7 @@ from typing import List
 
 import uvicorn
 import vllm  # assuming the vllm fork with control vectors is installed
-from common.const import EXTRACTION_POINT_ID
+from common.config import EXTRACTION_POINT_ID
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer
@@ -45,18 +46,13 @@ def get_model(model_id):
 
 
 @cache
-def get_steering_config_path(model_id, extraction_strategy_id):
+def get_steering_config_path(model_id, extraction_point_id):
     model_family, model_name = model_id.split("/")
     output_path = Path("outputs") / "thinking-steering-configs" / model_name
-    extraction_point_id = EXTRACTION_POINT_ID[model_id][extraction_strategy_id]
 
-    steering_config_path = (
-        output_path
-        / f"steering_config-{extraction_strategy_id}-{extraction_point_id}.npy"
-    )
-
-    if Path(steering_config_path).exists():
-        return steering_config_path
+    for p in Path(output_path).glob("*.npy"):
+        if extraction_point_id in p.name:
+            return p
 
     return None
 
@@ -66,12 +62,6 @@ app = FastAPI()
 
 LANGUAGE = "en"
 
-# Get model_id from environment variable or command line argument
-if len(sys.argv) > 1:
-    model_id = sys.argv[1]
-else:
-    raise ValueError("Model ID must be provided as a command line argument.")
-
 MODEL_PORTS = {
     "Qwen/Qwen3-4B": 9905,
     # "Qwen/Qwen3-8B": 9907,
@@ -79,19 +69,17 @@ MODEL_PORTS = {
     # "deepseek-ai/DeepSeek-R1-Distill-LLama-8B": 9907
 }
 
-# Get the port for the current model
-if model_id not in MODEL_PORTS:
-    raise ValueError(f"Model ID {model_id} is not recognized.")
-port = MODEL_PORTS.get(model_id)
-
-llm = get_model(model_id)
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Global variables to be set in main
+model_id = None
+port = None
+llm = None
+tokenizer = None
 
 
 # New endpoint for chat completions compatible with OpenAI API
-@app.post("/thinking_steering/{extraction_strategy_id}/{rotation_degree}")
+@app.post("/thinking_steering/{extraction_point_id}/{rotation_degree}")
 async def create_completion(
-    extraction_strategy_id, rotation_degree, request: CompletionRequest
+    extraction_point_id, rotation_degree, request: CompletionRequest
 ):
     global model_id, llm
 
@@ -102,7 +90,7 @@ async def create_completion(
         model_id = requested_model_id
 
     steering_config_path = get_steering_config_path(
-        requested_model_id, extraction_strategy_id
+        requested_model_id, extraction_point_id
     )
     if steering_config_path is None:
         raise HTTPException(status_code=404, detail="Steering config not found")
@@ -237,10 +225,10 @@ class ChatCompletionRequest(BaseModel):
 
 
 @app.post(
-    "/thinking_steering/{extraction_strategy_id}/{rotation_degree}/v1/chat/completions"
+    "/thinking_steering/{extraction_point_id}/{rotation_degree}/v1/chat/completions"
 )
 async def create_chat_completion_with_steering(
-    extraction_strategy_id: str, rotation_degree: str, request: ChatCompletionRequest
+    extraction_point_id: str, rotation_degree: str, request: ChatCompletionRequest
 ):
     global model_id, llm
 
@@ -251,7 +239,7 @@ async def create_chat_completion_with_steering(
         model_id = requested_model_id
 
     steering_config_path = get_steering_config_path(
-        requested_model_id, extraction_strategy_id
+        requested_model_id, extraction_point_id
     )
     if steering_config_path is None:
         raise HTTPException(status_code=404, detail="Steering config not found")
@@ -340,8 +328,32 @@ async def create_chat_completion_with_steering(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-# Add this at the bottom of the file
-if __name__ == "__main__":
+def main():
+    global model_id, port, llm, tokenizer
+
+    parser = argparse.ArgumentParser(description="Run thinking steering endpoint")
+    parser.add_argument("model_id", help="Model ID (e.g., Qwen/Qwen3-4B)")
+    parser.add_argument("--port", type=int, help="Port to run the server on")
+
+    args = parser.parse_args()
+
+    model_id = args.model_id
+
+    if args.port:
+        port = args.port
+    else:
+        # Get the port for the current model
+        if model_id not in MODEL_PORTS:
+            raise ValueError(f"Model ID {model_id} is not recognized.")
+        port = MODEL_PORTS.get(model_id)
+
+    llm = get_model(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
     print(f"Starting server for model: {model_id} on port: {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# Add this at the bottom of the file
+if __name__ == "__main__":
+    main()

@@ -3,5 +3,5 @@ wandb*
 __pycache__/
 .ipynb_checkpoints/
 *.egg-info/
-benchmarks/**/samples*
-thinking_models/outputs/
+*benchmarks*
+*outputs*

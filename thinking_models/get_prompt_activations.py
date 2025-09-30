@@ -213,7 +213,7 @@ if __name__ == "__main__":
     instructions_train, instructions_test = get_dataset_instructions(
         random_seed=args.random_seed
     )
-    
+
     if args.think_fast:
         instructions_train = preprocess_instructions(instructions_train)
         instructions_test = preprocess_instructions(instructions_test)
@@ -221,15 +221,20 @@ if __name__ == "__main__":
     # Get activations and save output to disk
     if args.end_index is None:
         args.end_index = args.batch_size
-    
+
+    args.end_index = min(args.end_index, len(instructions_train))
+
     sequences_activations = []
-    output_dir = args.output_dir / "activations"
+    output_dir = args.output_dir / "prompt"
     output_dir.mkdir(exist_ok=True)
 
     subset_instructions = instructions_train[: args.batch_size]
     for i in range(args.start_index, args.end_index):
         instruction = subset_instructions[i]
-        file_path = output_dir / f"prompt_activations_{i}.pt"
+        if not args.think_fast:
+            file_path = output_dir / f"prompt_activations_{i}.pt"
+        else:
+            file_path = output_dir / f"think_fast_prompt_activations_{i}.pt"
         # if file_path.exists():
         #     print(f"Skipping {file_path} because it already exists")
         #     continue
@@ -247,5 +252,3 @@ if __name__ == "__main__":
 
         save_tensor(seq_activations, file_path)
         print("--------------------------------")
-        if i > 2:
-            break

@@ -1,27 +1,27 @@
 EXTRACTION_POINT_ID = {
     "Qwen/Qwen3-4B": {
-        "s1_start_n_end": "input_layernorm_26",
-        "s2_start_2_n_end_2": "input_layernorm_29",
-        "s3_mean_thinking_n_mean_answer": "input_layernorm_23",
-        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_21",
+        "s1_start_n_end": "post_attention_layernorm_14",
+        "s2_start_2_n_end_2": "post_attention_layernorm_23",
+        "s3_mean_thinking_n_mean_answer": "input_layernorm_22",
+        "s4_vanilla_n_fast_thinking": "input_layernorm_25",
     },
     "Qwen/Qwen3-8B": {
-        "s1_start_n_end": "input_layernorm_29",
-        "s2_start_2_n_end_2": "input_layernorm_28",
-        "s3_mean_thinking_n_mean_answer": "input_layernorm_23",
-        "s4_vanilla_n_fast_thinking": "input_layernorm_28",
+        "s1_start_n_end": "post_attention_layernorm_16",
+        "s2_start_2_n_end_2": "input_layernorm_25",
+        "s3_mean_thinking_n_mean_answer": "input_layernorm_22",
+        "s4_vanilla_n_fast_thinking": "input_layernorm_23",
     },
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": {
-        "s1_start_n_end": "post_attention_layernorm_12",
-        "s2_start_2_n_end_2": "post_attention_layernorm_18",
-        "s3_mean_thinking_n_mean_answer": "post_attention_layernorm_21",
-        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_17",
+        "s1_start_n_end": "input_layernorm_15",
+        "s2_start_2_n_end_2": "input_layernorm_19",
+        "s3_mean_thinking_n_mean_answer": "input_layernorm_12",
+        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_16",
     },
     "deepseek-ai/DeepSeek-R1-Distill-LLama-8B": {
-        "s1_start_n_end": "input_layernorm_23",
+        "s1_start_n_end": "post_attention_layernorm_18",
         "s2_start_2_n_end_2": "post_attention_layernorm_22",
         "s3_mean_thinking_n_mean_answer": "post_attention_layernorm_20",
-        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_26",
+        "s4_vanilla_n_fast_thinking": "post_attention_layernorm_19",
     },
 }
 
