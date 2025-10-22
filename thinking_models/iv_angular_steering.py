@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Sequence
 
 import argparse
 import functools
+import math
 import random
 import json
 
@@ -217,7 +218,7 @@ def generate_completions(
     tokenized_instructions = tokenize_instructions_fn(
         instructions=instructions, system_prompt=system_prompt
     )
-    
+
     with add_hooks(
         module_forward_pre_hooks=fwd_pre_hooks, module_forward_hooks=fwd_hooks
     ), torch.inference_mode():
@@ -405,6 +406,253 @@ def generate_completions_delay(
         })
     return completions
 
+
+def _wrap_to_pm180(deg: float) -> float:
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def _nearest_angle(current_angle, target_angles) -> float:
+    return min(target_angles, key=lambda a: abs(_wrap_to_pm180(current_angle - a)))
+
+
+def make_dynamic_angular_hook_using_rotation_args(
+    first_direction,
+    second_direction,
+    gate: dict,
+    target_angles: List[float] = [90.0, 270.0],
+    adaptive_mode: int = 0,
+):
+    first_dir_base = torch.from_numpy(first_direction)
+    second_dir_base = torch.from_numpy(second_direction)
+
+    with torch.no_grad():
+        _, b1_cpu = _get_rotation_args(first_dir_base, second_dir_base, target_degree=0.0)
+        _, b2_cpu = _get_rotation_args(first_dir_base, second_dir_base, target_degree=90.0)
+
+    def hook_fn(module, inputs, output):
+        if isinstance(output, tuple):
+            act = output[0]
+            rest = output[1:]
+        else:
+            act = output
+            rest = None
+
+        if not gate.get("enabled", False):
+            return output
+
+        b1 = b1_cpu.to(act)
+        b2 = b2_cpu.to(act)
+
+        alpha = (act * b1).sum(dim=-1)
+        beta  = (act * b2).sum(dim=-1)
+
+        if gate.get("mode", "measure") == "measure":
+            alpha_last = alpha[:, -1].mean().item()
+            beta_last  = beta[:, -1].mean().item()
+            theta_now  = math.degrees(math.atan2(beta_last, alpha_last))  # [-180, 180)
+
+            gate["angle_cur_measured"] = theta_now
+            # Choose target angle
+            if gate.get("target_mode", "nearest_angle") == "nearest_angle":
+                gate["angle_target"] = _nearest_angle(theta_now, target_angles)
+            else:
+                gate["angle_target"] = float(gate.get("fixed_target_deg", 90.0))
+            gate["angle_cur"] = theta_now
+            gate["mode"] = "apply"  # start applying from next step
+            return output
+
+        # APPLY MODE: build projector and rotated vector for the CURRENT angle
+        angle_deg = float(gate["angle_cur"])
+        proj_matrix, rotated_component = _get_rotation_args(
+            first_directions=b1,
+            second_directions=b2,
+            target_degree=angle_deg,
+        )
+        proj_matrix      = proj_matrix.to(act)         # [..., D, D]
+        rotated_component= rotated_component.to(act)   # [..., D]
+
+        # Project to plane via P x and preserve in-plane norm
+        Px    = torch.einsum("...i, ...ij -> ...j", act, proj_matrix)  # [B,S,D]
+        scale = Px.norm(dim=-1, keepdim=True)                          # [B,S,1]
+
+        if adaptive_mode in {0, 4}:
+            act = act + (-Px + scale * rotated_component)
+        else:
+            # Choose feature direction for gating
+            if adaptive_mode == 1:
+                feature_direction = b1
+            elif adaptive_mode == 2:
+                feature_direction = b2
+            elif adaptive_mode == 3:
+                feature_direction = b1
+            else:
+                raise ValueError(f"Invalid adaptive_mode: {adaptive_mode}")
+            proj_to_feature = (act * feature_direction).sum(dim=-1)  # [B,S]
+            mask = (proj_to_feature > 0).unsqueeze(-1)               # [B,S,1]
+            act = act + mask * (scale * rotated_component - Px)
+
+        if rest is None:
+            return act
+        else:
+            return (act, *rest)
+
+    return hook_fn
+
+
+class ToggleHooksWithAngleSchedule(StoppingCriteria):
+    """
+    Does not stop generation.
+    - Turns hooks ON after `start_id`, with a delay of `delay_n` tokens.
+    - On the first enabled step, the hook is in "measure" mode (no rotation).
+    - Then, every `step_every` steps, moves `angle_cur` by ±`step_deg` toward `angle_target`.
+    - Turns hooks OFF after `end_id`.
+    """
+    def __init__(
+        self,
+        start_id: int,
+        end_id: int,
+        state: dict,
+        delay_n: int,
+        step_deg: float = 1.0,
+        step_every: int = 1,
+    ):
+        self.start = start_id
+        self.end   = end_id
+        self.st    = state
+        self.delay = max(int(delay_n), 0)
+        self.step_deg = float(step_deg)
+        self.step_every = max(int(step_every), 1)
+        self._tick = 0
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        last_ids = input_ids[:, -1]
+
+        # Observe start token
+        if not self.st.get("seen_start", False) and (last_ids == self.start).any():
+            self.st["seen_start"]  = True
+            self.st["delay_count"] = 0
+            self.st["enabled"]     = False
+            self.st["mode"]        = "measure"  # first ON step will only measure
+
+        # Handle delay and scheduling while before end
+        if self.st.get("seen_start", False) and not self.st.get("seen_end", False):
+            if not self.st.get("enabled", False):
+                self.st["delay_count"] += 1
+                if self.st["delay_count"] >= self.delay:
+                    self.st["enabled"] = True
+                    self._tick = 0
+
+            # If enabled and already in "apply" mode, move angle toward target
+            if self.st.get("enabled", False) and self.st.get("mode") == "apply" and "angle_cur" in self.st:
+                self._tick += 1
+                if self._tick % self.step_every == 0:
+                    err = _wrap_to_pm180(self.st["angle_target"] - self.st["angle_cur"])
+                    step = max(-self.step_deg, min(self.step_deg, err))
+                    self.st["angle_cur"] += step
+                    # print("Current angle:", self.st["angle_cur"])
+
+        # Observe end token
+        if not self.st.get("seen_end", False) and (last_ids == self.end).any():
+            self.st["seen_end"] = True
+            self.st["enabled"]  = False
+            self.st["mode"]     = "idle"
+
+        return False  # never stop generation here
+
+
+def generate_completions_scheduler(
+    model,
+    instructions: List[str],
+    tokenizer: AutoTokenizer,
+    tokenize_instructions_fn: Callable,
+    system_prompt: Optional[str],
+    module_dict: Dict[str, torch.nn.Module],
+    module_names: Sequence[str],                # list of module names to hook
+    first_direction,                            # np.ndarray[D] or torch.Tensor[D]
+    second_direction,                           # np.ndarray[D] or torch.Tensor[D]
+    *,
+    max_new_tokens: int = UPPERBOUND_MAX_NEW_TOKENS,
+    start_token_id: int = 151667,               # <think>
+    end_token_id: int   = 151668,               # </think>
+    start_delay_n: int  = 100,                  # wait N tokens after <think>
+    step_deg: float     = 1.0,                  # move ±1 degree per update
+    step_every: int     = 1,                    # update every k tokens
+    target_mode: str    = "nearest_angle",      # or "fixed"
+    target_angles: List[float] = [90.0, 270.0], # used if target_mode == "nearest_angle"
+    fixed_target_deg: float = 90.0,             # used if target_mode == "fixed"
+    adaptive_mode: int = 0,                     # pass-through of your gating semantics
+):
+    generation_config = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+        use_cache=True,
+    )
+
+    # Shared gate/state
+    gate = {
+        "enabled": False,
+        "seen_start": False,
+        "seen_end": False,
+        "delay_count": 0,
+        "mode": "idle",                 # "idle" -> "measure" -> "apply"
+        "angle_cur": None,
+        "angle_target": None,
+        "target_mode": target_mode,
+        "fixed_target_deg": fixed_target_deg,
+    }
+
+    # Build one hook per module name
+    fwd_hooks = []
+    for name in module_names:
+        if name not in module_dict:
+            continue
+        hook = make_dynamic_angular_hook_using_rotation_args(
+            first_direction=first_direction,
+            second_direction=second_direction,
+            gate=gate,
+            target_angles=target_angles,
+            adaptive_mode=adaptive_mode,
+        )
+        fwd_hooks.append((module_dict[name], hook))
+
+    # Scheduler / gating controller
+    stopping = StoppingCriteriaList([
+        ToggleHooksWithAngleSchedule(
+            start_id=start_token_id,
+            end_id=end_token_id,
+            state=gate,
+            delay_n=start_delay_n,
+            step_deg=step_deg,
+            step_every=step_every,
+        )
+    ])
+
+    # Tokenize
+    tokenized = tokenize_instructions_fn(instructions=instructions, system_prompt=system_prompt)
+
+    # Generate with hooks
+    completions = []
+    with add_hooks(module_forward_pre_hooks=[], module_forward_hooks=fwd_hooks):
+        with torch.inference_mode():
+            out = model.generate(
+                input_ids=tokenized.input_ids.to(model.device),
+                attention_mask=tokenized.attention_mask.to(model.device),
+                stopping_criteria=stopping,
+                **generation_config,
+            )
+    print("Target degree:", gate["angle_target"])
+    # Decode only new tokens
+    gen_tail = out[:, tokenized.input_ids.shape[-1]:]
+    for i, gen in enumerate(gen_tail):
+        completions.append({
+            "prompt": instructions[i],
+            "response": tokenizer.decode(gen, skip_special_tokens=True).strip(),
+            "target_degree": gate["angle_target"],
+        })
+    return completions
+
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -479,7 +727,7 @@ def parse_args() -> argparse.Namespace:
         "--target_angle",
         type=int,
         nargs="+",
-        default=[90, 120, 180, 200, 240, 270],
+        default=[90, 180, 200, 240, 270],
         help="Target angles for steering",
     )
     parser.add_argument(
@@ -518,9 +766,20 @@ def main() -> None:
 
     module_dict = dict(model.named_modules())
     module_names = args.module_names
-    module_name_list = [
-        f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names
-    ]
+    module_name_list = []
+    num_layers = model.config.num_hidden_layers
+    for i in range(num_layers):
+        for name in module_names:
+            if name != "input_layernorm":
+                module_name_list.append(f"model.layers.{i}.{name}")
+            elif i < num_layers - 1:
+                module_name_list.append(f"model.layers.{i+1}.{name}")
+            else:
+                continue
+
+        # module_name_list = [
+        #     f"model.layers.{i}.{name}" for i in range(model.config.num_hidden_layers) for name in module_names
+        # ]
 
     print("STARTING ANGULAR STEERING EXPERIMENTS")
     print("=" * 100)
@@ -534,45 +793,91 @@ def main() -> None:
             generate_completions_fn = generate_completions_early_stop
         case GenerationType.DELAY:
             generate_completions_fn = generate_completions_delay
-        case _:
-            raise ValueError(f"Invalid generation type: {args.generation_type}")
+        case GenerationType.SCHEDULER:
+            pass
 
-    for target_degree in args.target_angle:
-        answer_dict[target_degree] = {} # type: ignore
-        output_hooks = [
-            (
-                module_dict[module_name],
-                get_angular_steering_output_hook(
-                    first_direction=first_basis,
-                    second_direction=second_basis,
-                    target_degree=target_degree,
-                    adaptive_mode=0,
-                ),
-            )
-            for module_name in module_name_list
-        ]
 
-        for i in range(args.start_index, args.end_index):
-            print(f"\nSteering at {target_degree} degrees")
-            print("-" * 100)
-            print("QUESTION:\n", instructions_test[i])
-            print("ANSWER:")
-            completions = generate_completions_fn(
+    mapping = {
+        GenerationType.DEFAULT: generate_completions,
+        GenerationType.EARLY_STOP: generate_completions_early_stop,
+        GenerationType.DELAY: generate_completions_delay,
+    }
+
+    match args.generation_type:
+        case GenerationType.SCHEDULER:
+            for i in range(args.start_index, args.end_index):
+                completions = generate_completions_scheduler(
                 model=model,
                 instructions=[instructions_test[i]],
                 tokenizer=tokenizer,
                 tokenize_instructions_fn=tokenize_instructions_fn,
                 system_prompt=None,
-                # system_prompt="Answer in the most angry, frustrated and aggressive way possible.",
-                # fwd_pre_hooks=fwd_pre_hooks,
-                fwd_hooks=output_hooks,
                 max_new_tokens=args.upperbound_max_new_tokens,
+                module_dict=module_dict,
+                module_names=module_name_list,
+                first_direction=first_basis,
+                second_direction=second_basis,
+                start_token_id=151667,    # <think>
+                end_token_id=151668,      # </think>
+                start_delay_n=100,
+                step_deg=1.0,
+                step_every=1,
+                target_mode="nearest_angle",
+                target_angles=args.target_angle,
+                adaptive_mode=1,
             )
-            print(completions[0]["response"][:500])
-            print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
-            print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
-            print("_" * 100)
-        answer_dict[target_degree][i] = completions
+                print(f"\nSteering at {completions[0]['target_degree']} degrees")
+                print("-" * 100)
+                print("QUESTION:\n", instructions_test[i])
+                print("ANSWER:")
+                print(completions[0]["response"][:1500])
+                print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
+                print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
+                print("_" * 100)
+                target_degree = completions[0]['target_degree']
+                if target_degree not in answer_dict:
+                    answer_dict[target_degree] = {}
+                answer_dict[target_degree][i] = completions
+
+        case GenerationType.DEFAULT | GenerationType.EARLY_STOP | GenerationType.DELAY:
+            generate_completions_fn = mapping[args.generation_type]
+            for target_degree in args.target_angle:
+                answer_dict[target_degree] = {} # type: ignore
+                output_hooks = [
+                    (
+                        module_dict[module_name],
+                        get_angular_steering_output_hook(
+                            first_direction=first_basis,
+                            second_direction=second_basis,
+                            target_degree=target_degree,
+                            adaptive_mode=1,
+                        ),
+                    )
+                    for module_name in module_name_list
+                ]
+
+                for i in range(args.start_index, args.end_index):
+                    print(f"\nSteering at {target_degree} degrees")
+                    print("-" * 100)
+                    print("QUESTION:\n", instructions_test[i])
+                    print("ANSWER:")
+                    completions = generate_completions_fn(
+                        model=model,
+                        instructions=[instructions_test[i]],
+                        tokenizer=tokenizer,
+                        tokenize_instructions_fn=tokenize_instructions_fn,
+                        system_prompt=None,
+                        # fwd_pre_hooks=fwd_pre_hooks,
+                        fwd_hooks=output_hooks,
+                        max_new_tokens=args.upperbound_max_new_tokens,
+                    )
+                    print(completions[0]["response"][:1500])
+                    print(f"FIRST END THINK TOKEN POSITION: {completions[0]['response'].find('</think>')}")
+                    print(f"LAST END THINK TOKEN POSITION: {completions[0]['response'].rfind('</think>')}")
+                    print("_" * 100)
+                    answer_dict[target_degree][i] = completions
+        case _:
+            raise ValueError(f"Invalid generation type: {args.generation_type}")
 
     # Save answer_dict to json
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
