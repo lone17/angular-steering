@@ -5,19 +5,25 @@ import requests
 
 # Available models, languages and rotation degrees
 MODELS = [
-    "Qwen/Qwen2.5-32B-Instruct",
+    # "Qwen/Qwen2.5-32B-Instruct",
     # "Qwen/Qwen2.5-14B-Instruct",
-    # "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
     # "Qwen/Qwen2.5-3B-Instruct",
     # "meta-llama/Llama-3.2-3B-Instruct",
     # "meta-llama/Llama-3.1-8B-Instruct",
     # "google/gemma-2-9b-it",
 ]
 
-LANGUAGES = ["en_jp", "en", "jp"]
+PORTS = {
+    "Qwen/Qwen2.5-3B-Instruct": 9901,
+    "Qwen/Qwen2.5-7B-Instruct": 9902,
+    "Qwen/Qwen2.5-14B-Instruct": 9903,
+    "meta-llama/Llama-3.2-3B-Instruct": 9904,
+    "meta-llama/Llama-3.1-8B-Instruct": 9905,
+    "google/gemma-2-9b-it": 9906,
+}
 
-# Base URL for the API
-API_BASE_URL = "http://localhost:8000"
+LANGUAGES = ["en", "en_jp", "jp"]
 
 
 # Modified chat function to work with ChatInterface
@@ -76,7 +82,7 @@ def chat_with_steering(
     try:
         # Make API request
         response = requests.post(
-            f"{API_BASE_URL}/angular_steering/{language}/{rotation_degree}/v1/chat/completions",
+            f"http://localhost:{PORTS[model]}/angular_steering/{language}/{rotation_degree}/v1/chat/completions",
             json=request_data,
         )
 
@@ -112,8 +118,10 @@ def create_ui():
         gr.Markdown("# Angular Steering Demo for LLMs")
         gr.Markdown(
             """
-        This demo allows you to experiment with angular steering of language models.
-        Angular steering can control the model's behavior along specific dimensions.
+        This demo allows you to experiment with Angular Steering (NeurIPS 2025
+        Spotlight)
+        Check out the paper on [arXiv](https://arxiv.org/abs/2510.26243) and the
+        code on [GitHub](https://github.com/lone17/angular-steering/).
         """
         )
 
@@ -122,7 +130,7 @@ def create_ui():
             gr.Markdown(
                 """
             ## How to use this demo
-            
+
             1. **Select a model** from the dropdown
             2. **Enter an optional system prompt** to guide the model's behavior
             3. **Enable steering** and choose a steering angle (0-360 degrees)
@@ -130,22 +138,21 @@ def create_ui():
             5. **Adjust the temperature** (higher = more random, lower = more deterministic)
             6. **Set how much conversation history** to include
             7. **Start chatting!**
-            
+
             ### About Angular Steering
-            
+
             Angular steering allows fine-grained control over the model's behavior by manipulating its internal representations.
             Different steering angles affect how the model responds along specific learned dimensions:
-            
+
             - Angles closer to 0 or 360 may lead to more censored, safe, or constrained responses
             - Angles closer to 180 may allow more uncensored, nsfw responses
             - Uncheck "Enable Steering" to completely disable the steering effect
-            
+
             ### Parameters
-            
+
             - **Model**: The language model to use for generating responses
             - **System Prompt**: Instructions to guide the model's behavior
             - **Steering Angle**: Angle in degrees to steer the model's responses
-            - **Language**: Language to optimize the steering for
             - **Temperature**: Controls randomness (0 = deterministic, 2 = very random)
             - **History Length**: How many conversation turns to include in context
             """
@@ -159,7 +166,7 @@ def create_ui():
 
                 system_prompt = gr.Textbox(
                     label="System Prompt",
-                    placeholder="You are a helpful assistant...",
+                    placeholder="Optionally enter your system prompt here...",
                     lines=2,
                 )
 
@@ -182,13 +189,16 @@ def create_ui():
                 )
 
                 language_dropdown = gr.Dropdown(
-                    choices=LANGUAGES, label="Language", value=LANGUAGES[0]
+                    choices=LANGUAGES,
+                    label="Language",
+                    value=LANGUAGES[0],
+                    visible=False,
                 )
 
                 temperature_slider = gr.Slider(
                     minimum=0.0,
                     maximum=2.0,
-                    value=0.3,
+                    value=0.0,
                     step=0.1,
                     label="Temperature",
                     info=(
@@ -200,7 +210,7 @@ def create_ui():
                 history_length = gr.Slider(
                     minimum=-1,
                     maximum=10,
-                    value=5,
+                    value=0,
                     step=1,
                     label="Conversation History Length",
                     info="Number of turns to include (-1 for all history)",

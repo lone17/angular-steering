@@ -11,6 +11,8 @@ import vllm  # assuming the vllm fork with control vectors is installed
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer
+from vllm import LLM
+
 from vllm.control_vectors.request import ControlVectorRequest
 from vllm.sampling_params import SamplingParams
 
@@ -24,22 +26,35 @@ class CompletionRequest(BaseModel):
 
     model: str
     # messages: list[dict]  # each dict should have "role" and "content"
-    prompt: str | list[str]
+    prompt: str | list[str] | list[dict]
     max_tokens: int = 512
     logprobs: int = 0
     echo: bool = False
 
 
 def get_model(model_id):
-    return vllm.LLM(
-        model=model_id,
-        enable_control_vector=True,
-        max_control_vectors=1,
-        max_seq_len_to_capture=8096,
-        gpu_memory_utilization=0.6,
-        max_model_len=4096,
-        quantization="fp8",
-    )
+    if adaptive_mode < 3:
+        llm = LLM(
+            model=model_id,
+            enable_control_vector=True,
+            max_control_vectors=36,
+            max_seq_len_to_capture=8192,
+            enable_chunked_prefill=True,
+            gpu_memory_utilization=0.5,
+        )
+    else:
+        llm = LLM(
+            model=model_id,
+            enable_control_vector=True,
+            max_control_vectors=1,
+            max_seq_len_to_capture=8192,
+            max_num_batched_tokens=128,
+            max_num_seqs=128,
+            enable_chunked_prefill=True,
+            gpu_memory_utilization=0.5,
+        )
+
+    return llm
 
 
 @cache
@@ -58,7 +73,11 @@ def get_steering_config_path(model_id, direction_id, language_id):
         except ValueError:
             print(f"Skipping {steering_config_file}")
             continue
-        return steering_config_file
+
+        print("=" * 50)
+        print(f"Using steering config: {steering_config_file}")
+        print(type(steering_config_file))
+        return str(steering_config_file)
 
     return None
 
@@ -68,6 +87,8 @@ app = FastAPI()
 
 data_type = "harmful"
 LANGUAGE = "en"
+
+adaptive_mode = 1
 
 # Get model_id from environment variable or command line argument
 if len(sys.argv) > 1:
@@ -97,13 +118,14 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 # New endpoint for chat completions compatible with OpenAI API
 @app.post("/angular_steering/{rotation_degree}")
 async def create_completion(rotation_degree, request: CompletionRequest):
-    global model_id, llm
+    global model_id, llm, tokenizer
 
     requested_model_id = request.model
     language_id = LANGUAGE
 
     if not globals().get("model_id") or requested_model_id != model_id:
         llm = get_model(requested_model_id)
+        tokenizer = AutoTokenizer.from_pretrained(requested_model_id)
         model_id = requested_model_id
 
     steering_config_path = get_steering_config_path(
@@ -123,7 +145,7 @@ async def create_completion(rotation_degree, request: CompletionRequest):
             scale=10.0,
             target_degree=int(rotation_degree),
             keep_norm=False,
-            adaptive_mode=1,
+            adaptive_mode=adaptive_mode,
         )
 
     __params = request.model_dump()
@@ -135,12 +157,25 @@ async def create_completion(rotation_degree, request: CompletionRequest):
     sampling_params = SamplingParams(**__params)
 
     try:
-        outputs = llm.generate(
-            # messages=messages,
-            prompts=request.prompt,
-            sampling_params=sampling_params,
-            control_vector_request=cv_request,
-        )
+        if all(isinstance(item, dict) for item in request.prompt):
+            # If prompt is a list, we assume it's a list of strings or dicts
+
+            pprint(
+                tokenizer.apply_chat_template(
+                    request.prompt, tokenize=False, add_generation_prompt=True
+                )
+            )
+            outputs = llm.chat(
+                messages=request.prompt,
+                sampling_params=sampling_params,
+                control_vector_request=cv_request,
+            )
+        else:
+            outputs = llm.generate(
+                prompts=request.prompt,
+                sampling_params=sampling_params,
+                control_vector_request=cv_request,
+            )
 
         responses = []
         for item in outputs:
@@ -245,12 +280,13 @@ class ChatCompletionRequest(BaseModel):
 async def create_chat_completion_with_steering(
     language_id: str, rotation_degree: str, request: ChatCompletionRequest
 ):
-    global model_id, llm
+    global model_id, llm, tokenizer
 
     requested_model_id = request.model
 
     if not globals().get("model_id") or requested_model_id != model_id:
         llm = get_model(requested_model_id)
+        tokenizer = AutoTokenizer.from_pretrained(requested_model_id)
         model_id = requested_model_id
 
     steering_config_path = get_steering_config_path(
@@ -261,6 +297,8 @@ async def create_chat_completion_with_steering(
 
     cv_request = None
     if rotation_degree != "none":
+        print("=" * 50)
+        print(adaptive_mode)
         control_vector_name = (
             f"{model_id}/{steering_config_path}/{language_id}/{rotation_degree}"
         )
@@ -272,7 +310,7 @@ async def create_chat_completion_with_steering(
             scale=10.0,
             target_degree=int(rotation_degree),
             keep_norm=False,
-            adaptive_mode=1,
+            adaptive_mode=adaptive_mode,
         )
 
     # Convert the ChatCompletionRequest to a format suitable for llm.chat
@@ -288,26 +326,26 @@ async def create_chat_completion_with_steering(
 
     try:
         # Use the chat function instead of generate
-        outputs = llm.chat(
-            messages=messages,
-            sampling_params=sampling_params,
-            control_vector_request=cv_request,
-        )
+        # outputs = llm.chat(
+        #     messages=messages,
+        #     sampling_params=sampling_params,
+        #     control_vector_request=cv_request,
+        # )
 
         # apply chat template and call generate
-        # prompts = tokenizer.apply_chat_template(
-        #     messages, add_generation_prompt=True, tokenize=False
-        # )
+        prompts = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
 
         # import pdb
 
         # pdb.set_trace()
 
-        # outputs = llm.generate(
-        #     prompts=prompts,
-        #     sampling_params=sampling_params,
-        #     control_vector_request=cv_request,
-        # )
+        outputs = llm.generate(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            control_vector_request=cv_request,
+        )
 
         responses = []
         for item in outputs:
