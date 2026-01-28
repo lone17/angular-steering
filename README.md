@@ -14,8 +14,33 @@ The main source containing:
   - `endpoint.py`: an OpenAI-compatible endpoint server to play with Angular Steering.
   - `steering_demo.py`: a gradio chat UI that uses the endpoint server.
 
+## NEW: vLLM v1 Engine Support (feat/vllm_steering branch)
+
+This branch includes native vLLM v1 support using standard vLLM (no custom fork required):
+  - **`vllm_angular_steering.py`**: Complete module with steering logic and batch generation CLI
+
+Usage as library:
+```python
+from vllm import LLM
+from vllm_angular_steering import AngularSteering
+
+llm = LLM(model="Qwen/Qwen2.5-7B-Instruct", enforce_eager=True)
+steering = AngularSteering(llm)
+steering.load_config_from_file("steering_config.npy")
+steering.apply_steering(target_degree=180, adaptive_mode=1)
+```
+
+Usage for batch generation:
+```bash
+python vllm_angular_steering.py --model Qwen/Qwen2.5-7B-Instruct \
+    --config-dir output/Qwen2.5-7B-Instruct --language en --angle-step 10
+```
+
+Compatible with vLLM v0.6+ (requires `enforce_eager=True`). See module docstring for details.
+
 You will also need
-- Our fork of vLLM with the necessary modifications to support Angular Steering: https://github.com/lone17/vllm/
+- Our fork of vLLM with the necessary modifications to support Angular Steering: https://github.com/lone17/vllm/ (for original implementation)
+- **OR** Standard vLLM v0.6+ for the new `vllm_angular_steering.py` implementation
 
 # Installation
 
