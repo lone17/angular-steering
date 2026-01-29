@@ -5,6 +5,11 @@ This module provides angular steering support for vLLM v1 engine using the
 collective_rpc mechanism for hook registration. Compatible with standard vLLM
 (no custom fork needed).
 
+Supports both all-token and prompt-only steering modes:
+    - All-token mode: Steers both prompt and generation (default)
+    - Prompt-only mode: Only steers prompt, leaves generation unmodified
+      Uses vLLM's internal attention metadata for robust prefill/decode detection
+
 Requirements:
     - vLLM v0.6+ with enforce_eager=True
     - VLLM_ALLOW_INSECURE_SERIALIZATION=1 environment variable
@@ -23,7 +28,12 @@ Quick Start:
     >>> # Load and apply steering
     >>> steering = AngularSteering(llm)
     >>> steering.load_config_from_file("steering_config-en-max_sim_19_mid-pca_0.npy")
+    >>>
+    >>> # All-token mode (default)
     >>> steering.apply_steering(target_degree=180, adaptive_mode=1)
+    >>>
+    >>> # Prompt-only mode (only steer prompt, not generation)
+    >>> steering.apply_steering(target_degree=180, adaptive_mode=1, prompt_only=True)
     >>>
     >>> # Generate with steering (180° = maximum refusal)
     >>> outputs = llm.generate(["Design a phishing email..."],
@@ -208,10 +218,63 @@ class AngularSteeringOperator:
 # =============================================================================
 
 
+def _detect_prefill_decode_phase(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> bool:
+    """
+    Detect if we're in decode phase using vLLM's attention metadata.
+
+    Uses vLLM's internal forward_context to check max_query_len:
+    - Prefill: max_query_len > 1 (processing multiple input tokens)
+    - Decode: max_query_len == 1 (generating one token at a time)
+
+    Args:
+        hidden_states: Current hidden states tensor
+        layer_name: Name of the current layer (for logging)
+
+    Returns:
+        True if in decode phase, False if in prefill phase
+    """
+    try:
+        from vllm.forward_context import get_forward_context
+
+        forward_ctx = get_forward_context()
+        attn_metadata = forward_ctx.attn_metadata
+
+        # For v1 engine, attn_metadata might be a dict or direct metadata
+        if isinstance(attn_metadata, dict):
+            # Get metadata from first available layer
+            attn_meta = next(iter(attn_metadata.values())) if attn_metadata else None
+        else:
+            attn_meta = attn_metadata
+
+        if attn_meta is not None:
+            # Check max_query_len - most authoritative indicator
+            max_query_len = getattr(attn_meta, "max_query_len", None)
+            if max_query_len is not None:
+                return max_query_len == 1  # 1 = decode, >1 = prefill
+
+            # Fallback: Check num_decode_tokens
+            if hasattr(attn_meta, "num_decode_tokens"):
+                return attn_meta.num_decode_tokens > 0
+
+            # Fallback: Check num_prefill_tokens
+            if hasattr(attn_meta, "num_prefill_tokens"):
+                return attn_meta.num_prefill_tokens == 0
+
+    except Exception as e:
+        logger.debug(f"Metadata detection failed for {layer_name}: {e}")
+
+    # If metadata detection fails, assume prefill (safer default)
+    return False
+
+
 def create_steering_hook(
     operator: AngularSteeringOperator,
     state: Dict,
     layer_name: str,
+    prompt_only: bool = False,
 ) -> callable:
     """
     Create a forward hook for angular steering.
@@ -220,9 +283,10 @@ def create_steering_hook(
         operator: Shared steering operator instance
         state: Mutable dict containing 'target_degree', 'adaptive_mode', 'enabled'
         layer_name: Name of the layer this hook is attached to
+        prompt_only: If True, only steer prompt (not generation). If False, steer all tokens.
 
     Returns:
-        Hook function that applies steering to module outputs
+        Hook function that applies steering
     """
     _layer_name = layer_name
     _initial_operator = operator
@@ -238,6 +302,20 @@ def create_steering_hook(
         if not enabled:
             return output
 
+        # Handle tuple outputs (some models return (hidden_states, *rest))
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+            rest = output[1:]
+        else:
+            hidden_states = output
+            rest = None
+
+        # Prompt-only mode: skip steering during decode phase
+        if prompt_only:
+            is_decode = _detect_prefill_decode_phase(hidden_states, _layer_name)
+            if is_decode:
+                return output
+
         # Get current operator (supports dynamic updates)
         current_operator = getattr(builtins, "_steering_operator", _initial_operator)
 
@@ -246,14 +324,6 @@ def create_steering_hook(
         if last_theta is not None and last_theta != target_degree:
             current_operator.clear_rotation_cache()
         state["last_theta"] = target_degree
-
-        # Handle tuple outputs (some models return (hidden_states, *rest))
-        if isinstance(output, tuple):
-            hidden_states = output[0]
-            rest = output[1:]
-        else:
-            hidden_states = output
-            rest = None
 
         # Apply steering
         steered = current_operator.steer(
@@ -375,6 +445,7 @@ class AngularSteering:
         self,
         target_degree: float = 0.0,
         adaptive_mode: int = 1,
+        prompt_only: bool = False,
     ) -> Dict[str, int]:
         """
         Apply steering by registering hooks on model layers.
@@ -386,6 +457,8 @@ class AngularSteering:
         Args:
             target_degree: Rotation angle in degrees (0-360)
             adaptive_mode: Steering mode (0=non-adaptive, 1=adaptive)
+            prompt_only: If True, only steer during prompt processing (prefill phase).
+                         If False, steer all tokens including model-generated output (decode phase).
 
         Returns:
             Dictionary with registration results
@@ -443,6 +516,7 @@ class AngularSteering:
                         operator=shared_operator,
                         state=builtins._steering_state,
                         layer_name=layer_name,
+                        prompt_only=prompt_only,
                     )
 
                     # Register hook
@@ -595,7 +669,7 @@ def _format_prompts_for_vllm(instructions: List[str]) -> List[List[dict]]:
     return [[{"role": "user", "content": instruction}] for instruction in instructions]
 
 
-def _batch_generate_main():
+def main():
     """
     Generate responses with angular steering for evaluation pipeline.
     
@@ -680,6 +754,11 @@ def _batch_generate_main():
         type=int,
         default=1,
         help="Tensor parallel size for vLLM",
+    )
+    parser.add_argument(
+        "--prompt-only",
+        action="store_true",
+        help="Only steer prompt tokens (not generated tokens). Uses metadata-based detection.",
     )
 
     args = parser.parse_args()
@@ -787,6 +866,7 @@ def _batch_generate_main():
         steering.apply_steering(
             target_degree=0,
             adaptive_mode=args.adaptive_mode,
+            prompt_only=args.prompt_only,
         )
 
         # Generate at different angles with timing
@@ -834,4 +914,4 @@ def _batch_generate_main():
 
 
 if __name__ == "__main__":
-    _batch_generate_main()
+    main()
