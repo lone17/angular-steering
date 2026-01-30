@@ -347,8 +347,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="auto",
-        torch_dtype=torch.float32,
-        # torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     )
     model.eval()
 
@@ -395,69 +394,6 @@ def main():
     # Compute directions
     logger.info("\nComputing steering directions...")
     directions = compute_steering_directions(harmful_acts, harmless_acts, args.strategy)
-
-    # =========================================================================
-    # DEBUG: Save harmful/harmless activations for comparison (for later removal)
-    # =========================================================================
-    import json
-
-    # from pathlib import Path
-
-    debug_comparison_name = "extract_directions_debug"
-    debug_metadata = {
-        "name": debug_comparison_name,
-        "timestamp": str(np.datetime64("now")),
-        "model": args.model,
-        "language": args.language,
-        "harmful_shape": list(harmful_acts[list(harmful_acts.keys())[0]].shape),
-        "harmless_shape": list(harmless_acts[list(harmless_acts.keys())[0]].shape),
-        "n_samples": args.n_samples,
-        "batch_size": args.batch_size,
-        "positions": args.positions,
-        "strategy": args.strategy,
-    }
-
-    debug_harmful_path = output_path / f"DEBUG_harmful_acts_{debug_comparison_name}.npy"
-    debug_harmless_path = (
-        output_path / f"DEBUG_harmless_acts_{debug_comparison_name}.npy"
-    )
-    debug_metadata_path = (
-        output_path / f"DEBUG_comparison_metadata_{debug_comparison_name}.json"
-    )
-
-    # Convert dict of activations to stacked tensor
-    sorted_keys = sorted(
-        harmful_acts.keys(),
-        key=lambda k: (int(k.split("_")[1]), 0 if "mid" in k else 1),
-    )
-    harmful_stacked = torch.stack([harmful_acts[k] for k in sorted_keys])
-    harmless_stacked = torch.stack([harmless_acts[k] for k in sorted_keys])
-
-    # Reshape from (num_keys, batch, hidden_dim) to (num_layers, num_positions, batch, hidden_dim)
-    # where num_keys = num_layers * num_positions
-    num_layers = len(set(k.split("_")[1] for k in sorted_keys))
-    num_positions = len(sorted_keys) // num_layers
-    harmful_stacked = harmful_stacked.reshape(
-        num_layers, num_positions, harmful_stacked.shape[1], harmful_stacked.shape[2]
-    )
-    harmless_stacked = harmless_stacked.reshape(
-        num_layers, num_positions, harmless_stacked.shape[1], harmless_stacked.shape[2]
-    )
-
-    # Convert to float32 (numpy doesn't support bfloat16)
-    np.save(debug_harmful_path, harmful_stacked.float().cpu().numpy())
-    np.save(debug_harmless_path, harmless_stacked.float().cpu().numpy())
-
-    with open(debug_metadata_path, "w") as f:
-        json.dump(debug_metadata, f, indent=2)
-
-    logger.info(f"\n[DEBUG] Saved activations for comparison:")
-    logger.info(f"  Harmful acts: {debug_harmful_path}")
-    logger.info(f"  Harmless acts: {debug_harmless_path}")
-    logger.info(f"  Metadata: {debug_metadata_path}")
-    # =========================================================================
-    # END DEBUG
-    # =========================================================================
 
     # Save steering configs for ALL layers
     logger.info(f"\nSaving steering configs to {output_path}")

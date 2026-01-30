@@ -74,8 +74,7 @@ def tokenize_instructions_fn(instructions, tokenizer, system_prompt=None):
     Returns:
         Tokenized inputs as BatchEncoding with input_ids and attention_mask
     """
-    # Match angular_steering.ipynb: use apply_chat_template with return_tensors="pt"
-    input_ids = tokenizer.apply_chat_template(
+    inputs = tokenizer.apply_chat_template(
         [
             (
                 [{"role": "user", "content": instruction}]
@@ -91,16 +90,9 @@ def tokenize_instructions_fn(instructions, tokenizer, system_prompt=None):
         truncation=False,
         add_generation_prompt=True,
         return_tensors="pt",
+        return_dict=True,
     )
-    attention_mask = (input_ids != tokenizer.pad_token_id).long()
-
-    # Create a simple object that supports attribute access
-    class TokenizedOutput:
-        def __init__(self, input_ids, attention_mask):
-            self.input_ids = input_ids
-            self.attention_mask = attention_mask
-
-    return TokenizedOutput(input_ids, attention_mask)
+    return inputs
 
 
 @contextmanager
