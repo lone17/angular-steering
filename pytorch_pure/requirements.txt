@@ -1,0 +1,28 @@
+# Pure PyTorch Implementation Requirements
+# No vLLM or transformer_lens needed!
+
+# Core ML libraries
+torch>=2.0.0
+transformers>=4.40.0
+
+# Data loading
+datasets>=2.14.0
+pandas>=2.0.0
+requests>=2.31.0
+
+# ML utilities
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Optional: For LLM-as-a-judge evaluation (can be skipped)
+# litellm>=1.40.0
+
+# Optional: For visualization (use parent directory's notebook)
+# jupyter>=1.0.0
+# plotly>=5.14.0
+
+accelerate==1.12.0
+nbformat==5.10.4
