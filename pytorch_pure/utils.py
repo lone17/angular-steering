@@ -191,3 +191,43 @@ def get_mlp_input_hook(cache_key: str, cache: dict, extract_positions: list = No
             cache[cache_key] = acts
 
     return hook_fn
+
+
+# =============================================================================
+# Steering Config Save/Load Utilities
+# =============================================================================
+
+
+def save_steering_config(filepath: str, config: dict):
+    """Save steering configuration to .npy file.
+
+    Args:
+        filepath: Path to save config (should end with .npy)
+        config: Dictionary containing steering directions and metadata
+                Expected keys: first_direction, second_direction, layer, position, etc.
+    """
+    import numpy as np
+
+    # Ensure filepath has .npy extension
+    if not filepath.endswith(".npy"):
+        filepath = filepath.replace(".json", ".npy")
+
+    np.save(filepath, config, allow_pickle=True)
+
+
+def load_steering_config(filepath: str) -> dict:
+    """Load steering configuration from .npy file.
+
+    Args:
+        filepath: Path to config file (should end with .npy)
+
+    Returns:
+        Dictionary containing steering directions and metadata
+    """
+    import numpy as np
+
+    # Handle both .npy and .json extensions for backwards compatibility
+    if not filepath.endswith(".npy"):
+        filepath = filepath.replace(".json", ".npy")
+
+    return np.load(filepath, allow_pickle=True).item()
