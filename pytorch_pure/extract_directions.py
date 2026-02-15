@@ -66,8 +66,12 @@ def extract_activations(
 
     # Setup hooks for each layer and position
     # To match TransformerLens's resid_mid and resid_post:
-    # - "mid": residual stream after self-attention (before layernorm) → pre-hook on post_attention_layernorm
+    # - "mid": residual stream after self-attention + post-norm → pre-hook on pre_feedforward_layernorm
     # - "post": residual stream after MLP (end of block) → forward hook on layer output
+    #
+    # Note for Gemma-2: post_attention_layernorm is applied to attention OUTPUT (not MLP input)
+    # So resid_mid = resid_pre + post_attention_layernorm(attn_out)
+    # This happens right before pre_feedforward_layernorm, so we hook there.
 
     # Determine token positions to extract
     if num_last_tokens == 1:
@@ -97,10 +101,22 @@ def extract_activations(
                     )
                 )
 
-            # Hook for resid_mid (after attention, before post_attention_layernorm)
+            # Hook for resid_mid (after attention + post-norm, before MLP)
             if "mid" in positions:
-                layernorm_name = f"{layer_name}.post_attention_layernorm"
-                if layernorm_name in module_dict:
+                # For Gemma-2: Use pre_feedforward_layernorm
+                # Try multiple possible names for compatibility across architectures
+                possible_names = [
+                    f"{layer_name}.pre_feedforward_layernorm",  # Gemma-2
+                    f"{layer_name}.post_attention_layernorm",  # Gemma-1, Llama, etc.
+                ]
+
+                layernorm_name = None
+                for name in possible_names:
+                    if name in module_dict:
+                        layernorm_name = name
+                        break
+
+                if layernorm_name:
                     cache_key = f"layer_{layer_idx}_mid"
                     pre_hooks.append(
                         (

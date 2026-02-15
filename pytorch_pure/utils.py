@@ -167,7 +167,10 @@ def get_residual_hook(
 
 
 def get_mlp_input_hook(cache_key: str, cache: dict, extract_positions: list = None):
-    """Create pre-hook to capture resid_mid from post_attention_layernorm input.
+    """Create pre-hook to capture resid_mid before MLP processing.
+
+    For Gemma-2: Hooks pre_feedforward_layernorm to capture resid_mid (after attention + post-norm)
+    For other models: Hooks post_attention_layernorm to capture resid_mid (after attention)
 
     Args:
         cache_key: Key to use in cache dictionary (e.g., 'layer_10_mid')
