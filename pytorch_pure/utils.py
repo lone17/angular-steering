@@ -167,7 +167,10 @@ def get_residual_hook(
 
 
 def get_mlp_input_hook(cache_key: str, cache: dict, extract_positions: list = None):
-    """Create pre-hook to capture resid_mid from post_attention_layernorm input.
+    """Create pre-hook to capture resid_mid before MLP processing.
+
+    For Gemma-2: Hooks pre_feedforward_layernorm to capture resid_mid (after attention + post-norm)
+    For other models: Hooks post_attention_layernorm to capture resid_mid (after attention)
 
     Args:
         cache_key: Key to use in cache dictionary (e.g., 'layer_10_mid')
@@ -191,3 +194,43 @@ def get_mlp_input_hook(cache_key: str, cache: dict, extract_positions: list = No
             cache[cache_key] = acts
 
     return hook_fn
+
+
+# =============================================================================
+# Steering Config Save/Load Utilities
+# =============================================================================
+
+
+def save_steering_config(filepath: str, config: dict):
+    """Save steering configuration to .npy file.
+
+    Args:
+        filepath: Path to save config (should end with .npy)
+        config: Dictionary containing steering directions and metadata
+                Expected keys: first_direction, second_direction, layer, position, etc.
+    """
+    import numpy as np
+
+    # Ensure filepath has .npy extension
+    if not filepath.endswith(".npy"):
+        filepath = filepath.replace(".json", ".npy")
+
+    np.save(filepath, config, allow_pickle=True)
+
+
+def load_steering_config(filepath: str) -> dict:
+    """Load steering configuration from .npy file.
+
+    Args:
+        filepath: Path to config file (should end with .npy)
+
+    Returns:
+        Dictionary containing steering directions and metadata
+    """
+    import numpy as np
+
+    # Handle both .npy and .json extensions for backwards compatibility
+    if not filepath.endswith(".npy"):
+        filepath = filepath.replace(".json", ".npy")
+
+    return np.load(filepath, allow_pickle=True).item()

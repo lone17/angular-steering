@@ -20,6 +20,7 @@ from utils import (
     get_input_data,
     get_mlp_input_hook,
     get_residual_hook,
+    save_steering_config,
     tokenize_instructions_fn,
 )
 
@@ -39,6 +40,7 @@ def extract_activations(
     layers: list[int],
     positions: list[str],
     batch_size: int = 8,
+    num_last_tokens: int = 1,
 ):
     """Extract activations from specified layers and positions.
 
@@ -49,10 +51,12 @@ def extract_activations(
         layers: Layer indices to extract from (e.g., [10, 15, 20])
         positions: Positions within layers - 'mid' (after attention) and/or 'post' (after MLP)
         batch_size: Batch size for processing
+        num_last_tokens: Number of last tokens to extract (default 1)
 
     Returns:
         Dictionary mapping 'layer_{idx}_{position}' keys to activation tensors.
-        Activations have shape (num_samples, hidden_dim) with last token extracted.
+        If num_last_tokens == 1: shape (num_samples, hidden_dim)
+        If num_last_tokens > 1: shape (num_samples, num_last_tokens, hidden_dim)
     """
     # Prepare cache
     cache = {}
@@ -62,8 +66,19 @@ def extract_activations(
 
     # Setup hooks for each layer and position
     # To match TransformerLens's resid_mid and resid_post:
-    # - "mid": residual stream after self-attention (before layernorm) → pre-hook on post_attention_layernorm
+    # - "mid": residual stream after self-attention + post-norm → pre-hook on pre_feedforward_layernorm
     # - "post": residual stream after MLP (end of block) → forward hook on layer output
+    #
+    # Note for Gemma-2: post_attention_layernorm is applied to attention OUTPUT (not MLP input)
+    # So resid_mid = resid_pre + post_attention_layernorm(attn_out)
+    # This happens right before pre_feedforward_layernorm, so we hook there.
+
+    # Determine token positions to extract
+    if num_last_tokens == 1:
+        extract_positions = [-1]
+    else:
+        # Extract last N tokens: [-N, -N+1, ..., -2, -1]
+        extract_positions = list(range(-num_last_tokens, 0))
 
     forward_hooks = []
     pre_hooks = []
@@ -78,33 +93,48 @@ def extract_activations(
                     (
                         module_dict[layer_name],
                         get_residual_hook(
-                            cache_key_prefix, cache, ["post"], extract_positions=[-1]
+                            cache_key_prefix,
+                            cache,
+                            ["post"],
+                            extract_positions=extract_positions,
                         ),
                     )
                 )
 
-            # Hook for resid_mid (after attention, before post_attention_layernorm)
+            # Hook for resid_mid (after attention + post-norm, before MLP)
             if "mid" in positions:
-                layernorm_name = f"{layer_name}.post_attention_layernorm"
-                if layernorm_name in module_dict:
+                # For Gemma-2: Use pre_feedforward_layernorm
+                # Try multiple possible names for compatibility across architectures
+                possible_names = [
+                    f"{layer_name}.pre_feedforward_layernorm",  # Gemma-2
+                    f"{layer_name}.post_attention_layernorm",  # Gemma-1, Llama, etc.
+                ]
+
+                layernorm_name = None
+                for name in possible_names:
+                    if name in module_dict:
+                        layernorm_name = name
+                        break
+
+                if layernorm_name:
                     cache_key = f"layer_{layer_idx}_mid"
                     pre_hooks.append(
                         (
                             module_dict[layernorm_name],
                             get_mlp_input_hook(
-                                cache_key, cache, extract_positions=[-1]
+                                cache_key, cache, extract_positions=extract_positions
                             ),
                         )
                     )
 
-    # Tokenize ALL instructions at once (matches angular_steering.ipynb behavior)
-    # This ensures consistent padding across all batches
-    logger.info(f"Tokenizing {len(instructions)} instructions...")
-    tokenized = tokenize_instructions_fn(instructions, tokenizer)
-    logger.info(f"  Tokenized shape: {tokenized.input_ids.shape}")
+    all_input_ids = []
+    all_attention_mask = []
 
-    all_input_ids = tokenized.input_ids
-    all_attention_mask = tokenized.attention_mask
+    for i in range(0, len(instructions), batch_size):
+        batch_instructions = instructions[i : i + batch_size]
+        tokenized = tokenize_instructions_fn(batch_instructions, tokenizer)
+        all_input_ids.append(tokenized.input_ids)
+        all_attention_mask.append(tokenized.attention_mask)
 
     # Run forward passes with hooks in batches
     logger.info(f"Extracting activations from {len(instructions)} samples...")
@@ -112,27 +142,29 @@ def extract_activations(
         module_forward_pre_hooks=pre_hooks, module_forward_hooks=forward_hooks
     ):
         with torch.no_grad():
-            for i in tqdm(
-                range(0, len(instructions), batch_size),
-                total=(len(instructions) + batch_size - 1) // batch_size,
+            for batch_idx in tqdm(
+                range(len(all_input_ids)),
                 desc="Forward passes",
             ):
-                batch_input_ids = all_input_ids[i : i + batch_size]
-                batch_attention_mask = all_attention_mask[i : i + batch_size]
-
+                # Use batch_idx to index into the list of batches
+                batch_input_ids = all_input_ids[batch_idx]
+                batch_attention_mask = all_attention_mask[batch_idx]
                 _ = model(
                     input_ids=batch_input_ids.to(model.device),
                     attention_mask=batch_attention_mask.to(model.device),
                 )
 
     # Organize activations
-    # Convert cache to (layer, position, batch, hidden_dim) format
+    # Convert cache to appropriate format
     activations = {}
     for key, value in cache.items():
         # key format: "layer_{idx}_{position}"
-        activations[key] = value.squeeze(
-            1
-        )  # Remove token dim (we only kept last token)
+        if num_last_tokens == 1:
+            # Remove token dim for single token extraction (backward compatibility)
+            activations[key] = value.squeeze(1)  # (batch, 1, hidden) -> (batch, hidden)
+        else:
+            # Keep token dim for multiple token extraction
+            activations[key] = value  # (batch, num_tokens, hidden)
 
     return activations
 
@@ -429,7 +461,7 @@ def main():
         filename = f"steering_config-{args.language}-{strategy}_{best_layer_idx}_{position}-pca_0.npy"
         filepath = output_path / filename
 
-        np.save(filepath, config_all_layers, allow_pickle=True)
+        save_steering_config(str(filepath), config_all_layers)
         logger.info(
             f"  Saved: {filename} (best: layer {best_layer_idx}, {len(config_all_layers)} module entries)"
         )

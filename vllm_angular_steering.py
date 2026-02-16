@@ -97,10 +97,10 @@ class AngularSteeringOperator:
         Initialize the steering operator with basis vectors.
 
         Args:
-            first_direction: First basis vector (typically from harmful direction)
-            second_direction: Second basis vector (typically from PCA)
+            first_direction: First basis vector (numpy array)
+            second_direction: Second basis vector (numpy array)
         """
-        # Convert to torch tensors
+        # Convert numpy arrays to torch tensors
         self.first_direction = torch.from_numpy(first_direction).float()
         self.second_direction = torch.from_numpy(second_direction).float()
 
@@ -302,7 +302,10 @@ def create_steering_hook(
         if not enabled:
             return output
 
-        # Handle tuple outputs (some models return (hidden_states, *rest))
+        # Handle tuple outputs for forward compatibility
+        # - LayerNorm/RMSNorm: Always return single tensor (current use case)
+        # - Attention modules: Return (attn_output, attn_weights) tuple (future use case)
+        # - MLP modules: Return single tensor
         if isinstance(output, tuple):
             hidden_states = output[0]
             rest = output[1:]
@@ -332,7 +335,7 @@ def create_steering_hook(
             adaptive_mode=adaptive_mode,
         )
 
-        # Reconstruct output
+        # Return in same format as input (preserve tuple structure if present)
         if rest is not None:
             return (steered,) + rest
         return steered

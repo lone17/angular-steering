@@ -123,7 +123,7 @@ def get_angular_steering_output_hook(
     """Create a hook that applies angular steering to layer outputs.
 
     Args:
-        steering_config: Dict with 'first_direction' and 'second_direction' numpy arrays
+        steering_config: Dict with 'first_direction' and 'second_direction' (numpy arrays)
         target_degree: Rotation angle in degrees (0-360)
         adaptive_mode: Steering application mode:
                        0 = always steer all activations
@@ -132,6 +132,7 @@ def get_angular_steering_output_hook(
     Returns:
         Hook function that applies angular steering transformation to module outputs
     """
+    # Convert numpy arrays to torch tensors
     first_direction = torch.from_numpy(steering_config["first_direction"])
     second_direction = torch.from_numpy(steering_config["second_direction"])
 
@@ -162,8 +163,19 @@ def get_angular_steering_output_hook(
     _cache = {}
 
     def steering_hook(_module, _input, output):
-        device = output.device
-        dtype = output.dtype
+        # Handle tuple outputs for forward compatibility
+        # - LayerNorm/RMSNorm: Always return single tensor (current use case)
+        # - Attention modules: Return (attn_output, attn_weights) tuple (future use case)
+        # - MLP modules: Return single tensor
+        is_tuple = isinstance(output, tuple)
+        if is_tuple:
+            hidden_states = output[0]
+            rest = output[1:]
+        else:
+            hidden_states = output
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype
         cache_key = (device, dtype)
 
         if cache_key not in _cache:
@@ -175,21 +187,69 @@ def get_angular_steering_output_hook(
 
         proj, steer, first_dir = _cache[cache_key]
 
-        projected = output @ proj
+        projected = hidden_states @ proj
         scale = projected.norm(dim=-1, keepdim=True)
 
         if adaptive_mode == 0:
-            steered = output - projected + scale * steer
-            return steered
+            steered = hidden_states - projected + scale * steer
         elif adaptive_mode == 1:
-            proj_to_first = output @ first_dir
+            proj_to_first = hidden_states @ first_dir
             mask = (proj_to_first > 0).unsqueeze(-1)
-            steered = output - projected + scale * steer
-            return torch.where(mask, steered, output)
+            steered = hidden_states - projected + scale * steer
+            steered = torch.where(mask, steered, hidden_states)
         else:
             raise ValueError(f"Unknown adaptive_mode: {adaptive_mode}")
 
+        # Return in same format as input (preserve tuple structure if present)
+        if is_tuple:
+            return (steered,) + rest
+        else:
+            return steered
+
     return steering_hook
+
+
+def load_steering_hooks(npy_config_path, model, target_degree=180, adaptive_mode=1):
+    """Load multi-layer steering configuration and create hooks for all modules.
+
+    Args:
+        npy_config_path: Path to .npy config file containing steering directions for all layers
+        model: HuggingFace model instance
+        target_degree: Rotation angle in degrees (0-360)
+        adaptive_mode: Steering application mode (0=always, 1=conditional)
+
+    Returns:
+        List of (module, hook_fn) tuples ready to pass to generate_completions()
+
+    Example:
+        >>> from pathlib import Path
+        >>> config_path = Path("output/model/steering_config-en-max_sim_25_mid-pca_0.npy")
+        >>> hooks = load_steering_hooks(config_path, model, target_degree=180, adaptive_mode=1)
+        >>> completions = generate_completions(model, instructions, tokenizer, fwd_hooks=hooks)
+    """
+    import numpy as np
+    from pathlib import Path
+
+    npy_config_path = Path(npy_config_path)
+    if not npy_config_path.exists():
+        raise FileNotFoundError(f"Steering config not found: {npy_config_path}")
+
+    # Load config: dict mapping module names to steering configs
+    config = np.load(npy_config_path, allow_pickle=True).item()
+    module_dict = dict(model.named_modules())
+
+    # Create hooks for all modules
+    hooks = []
+    for module_name, steering_config in config.items():
+        if module_name in module_dict:
+            hook = get_angular_steering_output_hook(
+                steering_config=steering_config,
+                target_degree=target_degree,
+                adaptive_mode=adaptive_mode,
+            )
+            hooks.append((module_dict[module_name], hook))
+
+    return hooks
 
 
 def create_prompt_only_hook(base_hook_fn):
@@ -312,9 +372,6 @@ def main():
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Get module dict for hook registration
-    module_dict = dict(model.named_modules())
-
     # Load test data
     logger.info(f"Loading test data ({args.language})...")
     _, data_test = get_input_data("harmful", args.language)
@@ -383,9 +440,6 @@ def main():
         logger.info(f"Processing: {config_file.name}")
         logger.info(f"{'='*60}")
 
-        # Load config
-        config = np.load(config_file, allow_pickle=True).item()
-
         # Generate responses at different angles
         steered_responses = {}
         sweep_start = time.time()
@@ -393,18 +447,13 @@ def main():
         for degree in range(0, 360, args.angle_step):
             logger.info(f"  Generating at {degree}° rotation...")
 
-            # Setup steering hooks
-            output_hooks = [
-                (
-                    module_dict[module_name],
-                    get_angular_steering_output_hook(
-                        steering_config=steering_config,
-                        target_degree=degree,
-                        adaptive_mode=args.adaptive_mode,
-                    ),
-                )
-                for module_name, steering_config in config.items()
-            ]
+            # Load steering hooks for this angle
+            output_hooks = load_steering_hooks(
+                config_file,
+                model,
+                target_degree=degree,
+                adaptive_mode=args.adaptive_mode,
+            )
 
             # Generate
             completions = generate_completions(
