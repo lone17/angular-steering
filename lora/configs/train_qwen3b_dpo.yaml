@@ -1,0 +1,56 @@
+# LoRA training config: Qwen2.5-3B-Instruct — DPO objective
+# Direct Preference Optimisation: chosen = steered refusal, rejected = harmful baseline
+#
+# Prepare data first:
+#   python -m lora --config lora/configs/prepare_qwen3b_dpo.yaml --stage prepare
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_id: "Qwen/Qwen2.5-3B-Instruct"
+
+# ── Prepared data paths ────────────────────────────────────────────────────────
+harmful_prompts_file: "output/Qwen2.5-3B-Instruct/harmful-en-train-samples.json"
+harmful_responses_file: "output/Qwen2.5-3B-Instruct/harmful-en-train-max_sim_25_mid-pca_0-adaptive_1.json"
+
+# ── Training objective ────────────────────────────────────────────────────────
+training_objective: "dpo"
+
+# ── DPO chosen (what we want) ─────────────────────────────────────────────────
+steering_angle: 180
+filter_refusals: false
+pool_all_angles: false
+n_train: -1
+
+# ── DPO rejected (what we don't want) ──────────────────────────────────────────
+# Typically unsteered harmful baseline outputs
+# Point to baseline file (same model, same prompts, no steering)
+dpo_rejected_file: "output/Qwen2.5-3B-Instruct/harmful-en-train-baseline.json"
+dpo_rejected_angle: null    # null = treat as flat list
+dpo_beta: 0.1               # KL-regularisation coefficient
+
+# ── LoRA ──────────────────────────────────────────────────────────────────────
+lora_rank: 4
+lora_alpha: 16.0
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - v_proj
+
+# ── Training ──────────────────────────────────────────────────────────────────
+# DPO usually benefits from lower learning rate
+learning_rate: 5.0e-5
+num_epochs: 3
+per_device_batch_size: 1    # DPO doubles effective batch (chosen + rejected)
+gradient_accumulation_steps: 8
+max_seq_length: 512
+warmup_ratio: 0.1
+weight_decay: 0.0
+bf16: true
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output_dir: "/vast/llm/will/lora/output"
+run_name: null
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+n_eval: 20
+eval_max_new_tokens: 256
+eval_batch_size: 4

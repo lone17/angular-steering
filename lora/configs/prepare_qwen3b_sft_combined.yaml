@@ -1,0 +1,20 @@
+# Data preparation config for SFT-combined training
+# Generates both harmful AND harmless data
+# Run from angular-steering/ root:
+#   python -m lora --config lora/configs/prepare_qwen3b_sft_combined.yaml --stage prepare
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_id: "Qwen/Qwen2.5-3B-Instruct"
+
+# ── Steering config ────────────────────────────────────────────────────────────
+steering_config_file: "pytorch_pure/output/Qwen2.5-3B-Instruct/steering_config-en-max_sim_25_mid-pca_0.npy"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+data_dir: "output/Qwen2.5-3B-Instruct"
+
+# ── Data generation options ────────────────────────────────────────────────────
+data_split: "train"
+data_angles: []
+data_n_harmful: -1
+data_n_harmless: -1          # -1 = all harmless (for sft_combined)
+data_adaptive_mode: 1

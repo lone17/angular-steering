@@ -1,0 +1,20 @@
+# Data preparation config for DPO training
+# Generates steered responses at [180] (chosen) and baseline is provided separately
+# Run from angular-steering/ root:
+#   python -m lora --config lora/configs/prepare_qwen3b_dpo.yaml --stage prepare
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_id: "Qwen/Qwen2.5-3B-Instruct"
+
+# ── Steering config ────────────────────────────────────────────────────────────
+steering_config_file: "pytorch_pure/output/Qwen2.5-3B-Instruct/steering_config-en-max_sim_25_mid-pca_0.npy"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+data_dir: "output/Qwen2.5-3B-Instruct"
+
+# ── Data generation options ────────────────────────────────────────────────────
+data_split: "train"
+data_angles: [180]           # chosen responses; DPO rejected are provided separately
+data_n_harmful: -1
+data_n_harmless: 0           # harmless not needed for DPO
+data_adaptive_mode: 1

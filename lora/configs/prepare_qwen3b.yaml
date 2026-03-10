@@ -1,0 +1,22 @@
+# Data preparation config for Qwen2.5-3B-Instruct
+# Run from angular-steering/ root:
+#   python -m lora --config lora/configs/prepare_qwen3b.yaml --stage prepare
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_id: "Qwen/Qwen2.5-3B-Instruct"
+
+# ── Steering config ────────────────────────────────────────────────────────────
+# Path to the .npy steering directions file from pytorch_pure/
+steering_config_file: "pytorch_pure/output/Qwen2.5-3B-Instruct/steering_config-en-max_sim_25_mid-pca_0.npy"
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# Directory where prepared data is written
+# (defaults to output/{model_short}/ relative to repo root when empty)
+data_dir: "/vast/llm/will/data/lora/Qwen2.5-3B-Instruct"
+
+# ── Data generation options ────────────────────────────────────────────────────
+data_split: "train"          # "train" or "test"
+data_angles: []              # empty = generate all angles [0, 90, 180]
+data_n_harmful: -1           # -1 = all AdvBench harmful prompts
+data_n_harmless: 0           # 0 = skip (not needed for sft); -1 = all (for sft_combined)
+data_adaptive_mode: 1        # 1 = conditional steering (recommended), 0 = unconditional
