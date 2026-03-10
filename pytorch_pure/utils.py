@@ -23,37 +23,43 @@ from sklearn.model_selection import train_test_split
 # =============================================================================
 
 
-def get_harmful_instructions():
+def get_harmful_instructions(n_samples: int = 512, random_state=42, test_size=0.2):
     """Load harmful instructions from AdvBench dataset."""
     url = "https://raw.githubusercontent.com/llm-attacks/llm-attacks/main/data/advbench/harmful_behaviors.csv"
     response = requests.get(url)
     dataset = pd.read_csv(io.StringIO(response.content.decode("utf-8")))
     instructions = dataset["goal"].tolist()
-    train, test = train_test_split(instructions, test_size=0.2, random_state=42)
-    return train, test
+    train, test = train_test_split(
+        instructions, test_size=test_size, random_state=random_state
+    )
+    return train[:n_samples], test[:n_samples]
 
 
-def get_harmless_instructions():
+def get_harmless_instructions(n_samples: int = 512, random_state=42, test_size=0.2):
     """Load harmless instructions from Alpaca dataset."""
     dataset = load_dataset("tatsu-lab/alpaca")
     instructions = [
         item["instruction"] for item in dataset["train"] if item["input"].strip() == ""
     ]
-    train, test = train_test_split(instructions, test_size=0.2, random_state=42)
-    return train[:512], test[:128]
+    train, test = train_test_split(
+        instructions, test_size=test_size, random_state=random_state
+    )
+    return train[:n_samples], test[:n_samples]
 
 
 @cache
 def get_input_data(
-    data_type: str, language_id: str = "en"
+    data_type: str,
+    language_id: str = "en",
+    **kwargs,
 ) -> Tuple[List[str], List[str]]:
     """Get training and test data."""
     if language_id != "en":
         raise ValueError(f"Only English (en) is supported, got: {language_id}")
     if data_type == "harmful":
-        return get_harmful_instructions()
+        return get_harmful_instructions(**kwargs)
     elif data_type == "harmless":
-        return get_harmless_instructions()
+        return get_harmless_instructions(**kwargs)
     else:
         raise ValueError(f"Unknown data_type: {data_type}")
 
