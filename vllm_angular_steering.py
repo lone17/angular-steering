@@ -409,7 +409,7 @@ class AngularSteering:
         """
         self.llm = llm
 
-        if logger.isEnabledFor(logging.DEBUG) and _is_prefix_caching_enabled(llm):
+        if _is_prefix_caching_enabled(llm):
             logger.warning(
                 "Prefix caching is enabled. Use enable_prefix_caching=False "
                 "when sweeping multiple steering angles."
