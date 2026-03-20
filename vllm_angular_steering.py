@@ -23,9 +23,7 @@ Quick Start:
     >>>
     >>> os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     >>>
-    >>> # Initialize vLLM (enforce_eager=True and enable_prefix_caching=False are REQUIRED)
-    >>> # Prefix caching keys on token IDs only — reusing a cached KV from a different
-    >>> # steering angle silently corrupts the prompt activations for all passes after the first.
+    >>> # enforce_eager=True and enable_prefix_caching=False are REQUIRED
     >>> llm = LLM(model="Qwen/Qwen2.5-7B-Instruct", enforce_eager=True,
     ...           enable_prefix_caching=False)
     >>>
@@ -74,6 +72,15 @@ import torch.nn as nn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _is_prefix_caching_enabled(llm) -> bool:
+    """Return True if prefix caching is enabled on the vLLM engine."""
+    try:
+        engine = llm.llm_engine if hasattr(llm, "llm_engine") else llm
+        return getattr(engine.vllm_config.cache_config, "enable_prefix_caching", False)
+    except Exception:
+        return False
 
 
 # =============================================================================
@@ -402,24 +409,11 @@ class AngularSteering:
         """
         self.llm = llm
 
-        # Warn if prefix caching is enabled. vLLM keys the KV cache on token IDs
-        # only — when the same prompts are run at different steering angles, all
-        # passes after the first reuse the cached KV pairs from the first angle,
-        # so the prompt activations are never re-steered. This silently corrupts
-        # every degree except the first one in a sweep.
-        try:
-            engine = llm.llm_engine if hasattr(llm, "llm_engine") else llm
-            cache_config = engine.vllm_config.cache_config
-            if getattr(cache_config, "enable_prefix_caching", False):
-                logger.warning(
-                    "Prefix caching is ENABLED. When sweeping multiple steering "
-                    "angles over the same prompts, vLLM will reuse the KV cache "
-                    "from the first pass (angle) for all subsequent passes, so the "
-                    "prompt is only steered at the first angle. "
-                    "Initialize LLM with enable_prefix_caching=False."
-                )
-        except Exception:
-            pass
+        if logger.isEnabledFor(logging.DEBUG) and _is_prefix_caching_enabled(llm):
+            logger.warning(
+                "Prefix caching is enabled. Use enable_prefix_caching=False "
+                "when sweeping multiple steering angles."
+            )
         self.steering_configs: Dict[str, AngularSteeringOperator] = {}
         self.hooks_registered = False
 
@@ -842,10 +836,7 @@ def main():
     llm = LLM(
         model=args.model,
         enforce_eager=True,  # REQUIRED for hooks
-        enable_prefix_caching=False,  # REQUIRED: cache keys are token-ID-only, so
-        # identical prompts at different steering angles would reuse the first angle's
-        # cached KV pairs, silently giving wrong activations for the prompt on all
-        # passes after the first.
+        enable_prefix_caching=False,  # REQUIRED: avoids reusing stale KV across steering angles
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         disable_log_stats=True,  # Cleaner logging
