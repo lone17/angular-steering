@@ -275,6 +275,7 @@ def create_steering_hook(
     state: Dict,
     layer_name: str,
     prompt_only: bool = False,
+    generation_only: bool = False,
 ) -> callable:
     """
     Create a forward hook for angular steering.
@@ -284,10 +285,15 @@ def create_steering_hook(
         state: Mutable dict containing 'target_degree', 'adaptive_mode', 'enabled'
         layer_name: Name of the layer this hook is attached to
         prompt_only: If True, only steer prompt (not generation). If False, steer all tokens.
+        generation_only: If True, only steer generation (not prompt). If False, steer all tokens.
+            prompt_only and generation_only are mutually exclusive.
 
     Returns:
         Hook function that applies steering
     """
+    if prompt_only and generation_only:
+        raise ValueError("prompt_only and generation_only are mutually exclusive")
+
     _layer_name = layer_name
     _initial_operator = operator
 
@@ -314,6 +320,12 @@ def create_steering_hook(
         if prompt_only:
             is_decode = _detect_prefill_decode_phase(hidden_states, _layer_name)
             if is_decode:
+                return output
+
+        # Generation-only mode: skip steering during prefill phase
+        if generation_only:
+            is_decode = _detect_prefill_decode_phase(hidden_states, _layer_name)
+            if not is_decode:
                 return output
 
         # Get current operator (supports dynamic updates)
@@ -446,6 +458,7 @@ class AngularSteering:
         target_degree: float = 0.0,
         adaptive_mode: int = 1,
         prompt_only: bool = False,
+        generation_only: bool = False,
     ) -> Dict[str, int]:
         """
         Apply steering by registering hooks on model layers.
@@ -459,10 +472,14 @@ class AngularSteering:
             adaptive_mode: Steering mode (0=non-adaptive, 1=adaptive)
             prompt_only: If True, only steer during prompt processing (prefill phase).
                          If False, steer all tokens including model-generated output (decode phase).
+            generation_only: If True, only steer during generation (decode phase).
+                             If False, steer all tokens. Mutually exclusive with prompt_only.
 
         Returns:
             Dictionary with registration results
         """
+        if prompt_only and generation_only:
+            raise ValueError("prompt_only and generation_only are mutually exclusive")
         if not self.steering_configs:
             raise ValueError(
                 "No steering configurations loaded. Call load_config_from_file() first."
@@ -517,6 +534,7 @@ class AngularSteering:
                         state=builtins._steering_state,
                         layer_name=layer_name,
                         prompt_only=prompt_only,
+                        generation_only=generation_only,
                     )
 
                     # Register hook
